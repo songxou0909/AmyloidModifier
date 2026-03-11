@@ -371,7 +371,7 @@ def open_chain_modifier():
         def initUI(self):
             main_l = QHBoxLayout()
             splitter = QSplitter(Qt.Orientation.Horizontal)
-            left = QWidget(); l_lay = QVBoxLayout(left); l_lay.setSpacing(10); l_lay.setContentsMargins(10,10,10,10)
+            left = QWidget(); l_lay = QVBoxLayout(left); l_lay.setSpacing(2); l_lay.setContentsMargins(4, 4, 4, 4)
             
             hb_load = QHBoxLayout()
             self.cmb_models = QComboBox()
@@ -382,7 +382,7 @@ def open_chain_modifier():
             self.auto_refresh_timer.timeout.connect(self.populate_models)
             self.auto_refresh_timer.start(1000)
             
-            self.btn_load_model = QPushButton('Load and Copy from ChimeraX')
+            self.btn_load_model = QPushButton('Load Model')
             self.btn_load_model.clicked.connect(self.load_from_chimerax)
             hb_load.addWidget(self.btn_load_model)
             l_lay.addLayout(hb_load)
@@ -391,14 +391,14 @@ def open_chain_modifier():
             l_lay.addWidget(self.lbl_status)
             
             self.grp_ops = QGroupBox("Operations"); self.grp_ops.setEnabled(False)
-            ops_l = QVBoxLayout()
+            ops_l = QVBoxLayout(); ops_l.setSpacing(2); ops_l.setContentsMargins(4, 10, 4, 4)
             self.btn_trim = QPushButton("Trim Best Layers")
             self.btn_trim.setToolTip("Select the layers wanted and save as a new CIF file")
             self.btn_trim.clicked.connect(self.open_trim_dialog)
             ops_l.addWidget(self.btn_trim)
             self.grp_ops.setLayout(ops_l); l_lay.addWidget(self.grp_ops)
             
-            grp_p = QGroupBox("Detection Parameters"); form = QFormLayout()
+            grp_p = QGroupBox("Detection Parameters"); form = QFormLayout(); form.setContentsMargins(4, 10, 4, 4); form.setVerticalSpacing(2)
             self.ed_chn = QLineEdit("4"); self.ed_chn.setValidator(QIntValidator())
             form.addRow("Chains per Layer:", self.ed_chn)
             self.ed_zmn = QLineEdit("0.0"); self.ed_zmn.setValidator(QDoubleValidator())
@@ -410,7 +410,8 @@ def open_chain_modifier():
             
             self.txt = QTextBrowser(); self.txt.setOpenLinks(False); self.txt.anchorClicked.connect(self.link_clk)
             self.txt.setStyleSheet("font-family: Consolas, monospace;")
-            l_lay.addWidget(self.txt)
+            self.txt.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+            l_lay.addWidget(self.txt, 1)
             
             right = QWidget(); r_lay = QHBoxLayout(right); r_lay.setContentsMargins(0,0,0,0)
             self.cvs = CIFMol3DCanvas(self, dpi=100); r_lay.addWidget(self.cvs, 1)
@@ -419,17 +420,21 @@ def open_chain_modifier():
             r_lay.addWidget(sl)
             
             splitter.addWidget(left); splitter.addWidget(right)
-            splitter.setSizes([250, 300]) 
-            splitter.setStretchFactor(0, 4); splitter.setStretchFactor(1, 6)
+             
+            splitter.setStretchFactor(0, 5); splitter.setStretchFactor(1, 5)
             main_l.addWidget(splitter); self.setLayout(main_l)
 
         def populate_models(self):
             from chimerax.atomic import AtomicStructure
             current_models = self.session.models.list(type=AtomicStructure)
-            current_ids = {m.id_string for m in current_models}
+            current_ids = {(m.id_string, id(m)) for m in current_models}
             if current_ids != self._last_model_ids:
                 current_sel = self.cmb_models.currentData()
-                current_sel_id = current_sel.id_string if current_sel else None
+                try:
+                    current_sel_id = current_sel.id_string if current_sel and not getattr(current_sel, 'deleted', False) else None
+                except Exception:
+                    current_sel_id = None
+                    
                 self.cmb_models.blockSignals(True)
                 self.cmb_models.clear()
                 for model in current_models:
@@ -437,7 +442,7 @@ def open_chain_modifier():
                 if current_sel_id:
                     for i in range(self.cmb_models.count()):
                         m = self.cmb_models.itemData(i)
-                        if m and m.id_string == current_sel_id:
+                        if m and getattr(m, 'id_string', '') == current_sel_id:
                             self.cmb_models.setCurrentIndex(i)
                             break
                 self.cmb_models.blockSignals(False)
@@ -613,8 +618,8 @@ def open_chain_modifier():
             main_layout = QHBoxLayout()
             left_widget = QWidget()
             layout = QVBoxLayout(left_widget)
-            layout.setSpacing(10)
-            layout.setContentsMargins(10, 10, 10, 10)
+            layout.setSpacing(2)
+            layout.setContentsMargins(4, 4, 4, 4)
 
             hb_load = QHBoxLayout()
             self.cmb_models = QComboBox()
@@ -625,7 +630,7 @@ def open_chain_modifier():
             self.auto_refresh_timer.timeout.connect(self.populate_models)
             self.auto_refresh_timer.start(1000)
             
-            self.btn_load_model = QPushButton('Load and Copy from ChimeraX')
+            self.btn_load_model = QPushButton('Load Model')
             self.btn_load_model.clicked.connect(self.load_from_chimerax)
             hb_load.addWidget(self.btn_load_model)
             hb_load.addStretch()
@@ -656,9 +661,11 @@ def open_chain_modifier():
             hb_load.addWidget(self.chk_anti)
             layout.addLayout(hb_load)
 
-            self.grp_ops = QGroupBox("Operations (Applied to Temporary Copy)")
+            self.grp_ops = QGroupBox("Operations")
             self.grp_ops.setEnabled(False) 
             v_ops = QVBoxLayout()
+            v_ops.setSpacing(2)
+            v_ops.setContentsMargins(4, 10, 4, 4)
 
             hb_trim = QHBoxLayout()
             self.btn_trim = QPushButton("Trim/Expand Layers")
@@ -666,10 +673,11 @@ def open_chain_modifier():
             self.btn_trim.clicked.connect(self.action_trim)
             hb_trim.addWidget(self.btn_trim)
             hb_trim.addWidget(QLabel("Target Layers:"))
-            self.spin_trim = QSpinBox()
-            self.spin_trim.setRange(1, 500)
-            self.spin_trim.setValue(5)
-            hb_trim.addWidget(self.spin_trim)
+            self.edit_trim = QLineEdit("5")
+            self.edit_trim.setValidator(QIntValidator(1, 500))
+            self.edit_trim.setFixedWidth(50)
+            hb_trim.addWidget(self.edit_trim)
+            hb_trim.addStretch()
             v_ops.addLayout(hb_trim)
 
             hb_ren = QHBoxLayout()
@@ -704,7 +712,8 @@ def open_chain_modifier():
 
             self.grp_params = QGroupBox("Detection Parameters")
             params_layout = QFormLayout()
-            params_layout.setContentsMargins(5, 5, 5, 5)
+            params_layout.setContentsMargins(4, 10, 4, 4)
+            params_layout.setVerticalSpacing(2)
 
             def create_param_input(default_val, tooltip_msg, is_int=False):
                 line_edit = QLineEdit()
@@ -715,36 +724,38 @@ def open_chain_modifier():
                 line_edit.setToolTip(tooltip_msg) 
                 return line_edit
 
-            self.edit_z_min = create_param_input(4.6, "Minimum vertical distance to be considered a layer stack")
+            self.edit_z_min = create_param_input(4.6, "Minimum vertical distance to be considered as a layer stack")
             params_layout.addRow("Z Shift Min (Å):", self.edit_z_min)
-            self.edit_z_max = create_param_input(5.0, "Maximum vertical distance to be considered a layer stack")
+            self.edit_z_max = create_param_input(5.0, "Maximum vertical distance to be considered as a layer stack")
             params_layout.addRow("Z Shift Max (Å):", self.edit_z_max)
             self.edit_xy_limit = create_param_input(3.0, "Maximum horizontal drift allowed between stacked subunits")
             params_layout.addRow("XY Shift Limit (Å):", self.edit_xy_limit)
-            self.edit_neighbor_count = create_param_input(6, "How many closest chains to check for stacking", is_int=True)
+            self.edit_neighbor_count = create_param_input(6, "How many closest chains to search for stacking each time", is_int=True)
             params_layout.addRow("Neighbor Search Count:", self.edit_neighbor_count)
             self.edit_water_z = create_param_input(2.5, "Maximum vertical distance from the protein layer centroids for a water/ion to be included")
             params_layout.addRow("Water/Ion Z Shift:", self.edit_water_z)
 
             self.grp_params.setLayout(params_layout)
-            layout.addWidget(self.grp_params)
 
             self.text_area = QTextEdit()
             self.text_area.setReadOnly(True)
+            self.text_area.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
             font = self.text_area.font()
             font.setFamily("Courier New")
-            font.setPointSize(9)
+            font.setPointSize(7)
             self.text_area.setFont(font)
-            layout.addWidget(self.text_area)
+            layout.addWidget(self.text_area, 1)
 
-            # --- 1. SETUP THE RIGHT PANEL (3D VIEWER) ---
             right_widget = QWidget()
-            r_layout = QHBoxLayout(right_widget)
+            r_layout = QVBoxLayout(right_widget)
             r_layout.setContentsMargins(0, 0, 0, 0)
             r_layout.setSpacing(2)
+            r_layout.addWidget(self.grp_params)
+
+            viewer_layout = QHBoxLayout()
 
             self.mol_canvas = Mol3DCanvas(self, width=3, height=4, dpi=100)
-            r_layout.addWidget(self.mol_canvas, 1)
+            viewer_layout.addWidget(self.mol_canvas, 1)
 
             self.zoom_slider = QSlider(Qt.Orientation.Vertical)
             self.zoom_slider.setRange(1, 100)
@@ -753,14 +764,14 @@ def open_chain_modifier():
             self.zoom_slider.setTickInterval(10)
             self.zoom_slider.valueChanged.connect(lambda v: self.mol_canvas.set_zoom_from_slider(v))
             self.mol_canvas.slider_callback = lambda v: self.zoom_slider.setValue(v)
-            r_layout.addWidget(self.zoom_slider)
+            viewer_layout.addWidget(self.zoom_slider)
 
-            # --- 2. WRAP BOTH SIDES IN A SPLITTER ---
+            r_layout.addLayout(viewer_layout)
+
             splitter = QSplitter(Qt.Orientation.Horizontal)
             splitter.addWidget(left_widget)
             splitter.addWidget(right_widget)
             
-            splitter.setSizes([250, 300]) 
             splitter.setStretchFactor(0, 4)
             splitter.setStretchFactor(1, 6)
 
@@ -853,11 +864,14 @@ def open_chain_modifier():
         def populate_models(self):
             from chimerax.atomic import AtomicStructure
             current_models = self.session.models.list(type=AtomicStructure)
-            current_ids = {m.id_string for m in current_models}
+            current_ids = {(m.id_string, id(m)) for m in current_models}
             
             if current_ids != self._last_model_ids:
                 current_sel = self.cmb_models.currentData()
-                current_sel_id = current_sel.id_string if current_sel else None
+                try:
+                    current_sel_id = current_sel.id_string if current_sel and not getattr(current_sel, 'deleted', False) else None
+                except Exception:
+                    current_sel_id = None
                 
                 self.cmb_models.blockSignals(True)
                 self.cmb_models.clear()
@@ -868,7 +882,7 @@ def open_chain_modifier():
                 if current_sel_id:
                     for i in range(self.cmb_models.count()):
                         m = self.cmb_models.itemData(i)
-                        if m and m.id_string == current_sel_id:
+                        if m and getattr(m, 'id_string', '') == current_sel_id:
                             self.cmb_models.setCurrentIndex(i)
                             break
                             
@@ -891,6 +905,9 @@ def open_chain_modifier():
                 self.created_temp_files.append(temp_path)
                 self.working_file_path = temp_path
                 self.grp_ops.setEnabled(True)
+                
+                self.working_model_id = None 
+                
                 self.reload_working_model()
                 self.text_area.clear()
                 self.text_area.append(f"Created PDB working copy from {model.name}")
@@ -987,7 +1004,12 @@ def open_chain_modifier():
 
         def action_trim(self):
             if not self.working_file_path: return
-            target_layers = self.spin_trim.value()
+            try:
+                target_layers = int(self.edit_trim.text())
+            except ValueError:
+                QMessageBox.warning(self, "Invalid Input", "Please enter a valid integer for Target Layers.")
+                return
+                
             total_layers = self.detected_layers
             
             if target_layers == total_layers:
@@ -1041,12 +1063,16 @@ def open_chain_modifier():
                     self.text_area.append("Calculating expansion transformations...")
                     layers_to_add = target_layers - total_layers
                     water_z_limit = self.get_param(self.edit_water_z, 2.5)
-                    self.write_expanded_pdb(self.working_file_path, new_temp, layers_to_add, use_auto, manual_twist, manual_rise, water_z_limit, use_alt)
+                    applied_twist, applied_rise = self.write_expanded_pdb(self.working_file_path, new_temp, layers_to_add, use_auto, manual_twist, manual_rise, water_z_limit, use_alt)
                     shutil.move(new_temp, self.working_file_path)
                     self.text_area.append(f"\n>>>> Applied Expansion (Added {layers_to_add} layers, Alternating: {use_alt})")
 
                 self.reload_working_model()
                 self.process_pdb(self.working_file_path)
+                
+                if target_layers > total_layers:
+                    self.text_area.append(f"\nApplied Twist: {applied_twist:.5f}°")
+                    self.text_area.append(f"Applied Rise: {applied_rise:.5f} Å")
                 
             except Exception as e: 
                 QMessageBox.critical(self, "Error", f"Action failed: {e}")
@@ -1208,6 +1234,10 @@ def open_chain_modifier():
                     pass
 
             expansions = [] 
+            reported_twist = manual_twist
+            reported_rise = manual_rise
+            first_auto_calc = False
+
             for sandwich in self.final_sandwiches:
                 if len(sandwich) == 0: continue
                 
@@ -1244,6 +1274,13 @@ def open_chain_modifier():
                         base_t_bottom = np.array([0.0, 0.0, -rise])
                         t_bottom = global_centroid - R_bottom @ global_centroid + base_t_bottom
                     
+                    if use_auto and not first_auto_calc:
+                        t_ang = math.degrees(math.atan2(R_top[1, 0], R_top[0, 0]))
+                        b_t = t_top - global_centroid + R_top @ global_centroid
+                        reported_twist = t_ang / 2.0
+                        reported_rise = b_t[2] / 2.0
+                        first_auto_calc = True
+
                     if len(sandwich) >= 2:
                         prev_b1 = sandwich[1]
                         prev_b2 = sandwich[0]
@@ -1286,6 +1323,13 @@ def open_chain_modifier():
                         base_t_bottom = np.array([0.0, 0.0, -manual_rise])
                         t_bottom = global_centroid - R_bottom @ global_centroid + base_t_bottom
                     
+                    if use_auto and not first_auto_calc:
+                        t_ang = math.degrees(math.atan2(R_top[1, 0], R_top[0, 0]))
+                        b_t = t_top - global_centroid + R_top @ global_centroid
+                        reported_twist = t_ang
+                        reported_rise = b_t[2]
+                        first_auto_calc = True
+
                     current_ref_chain = bottom_chain
                     for _ in range(bottom_layers_to_add):
                         new_chain_id = get_new_chain_id()
@@ -1453,6 +1497,8 @@ def open_chain_modifier():
                     except: pass
                     
                 fout.write("END   \n")
+
+            return reported_twist, reported_rise
 
         def action_restrain(self):
             if not self.final_sandwiches or self.detected_layers == 0: return
@@ -2232,18 +2278,16 @@ class PDBModifierTool(ToolInstance):
         layout.setContentsMargins(0, 0, 0, 0)
         layout.addWidget(self.widget)
         self.tool_window.ui_area.setLayout(layout)
-        
-        self.widget.setMinimumWidth(350)
-        
+
         self.tool_window.manage("right")
         
         self.widget.setStyleSheet("""
-            QMainWindow, QDialog, QWidget { background-color: #1e1e1e; color: #d4d4d4; font-family: Arial; font-size: 10pt; }
+            QMainWindow, QDialog, QWidget { background-color: #1e1e1e; color: #d4d4d4; font-family: Arial; font-size: 8pt; }
             QPushButton { background-color: #3e3e42; color: #d4d4d4; border: 1px solid #3e3e42; padding: 5px 15px; border-radius: 4px; }
             QPushButton:hover { background-color: #4e4e52; border: 1px solid #98c379; }
             QPushButton:pressed, QPushButton:checked { background-color: #98c379; color: #1e1e1e; border: 1px solid #98c379; }
-            QLineEdit, QSpinBox, QTextEdit, QTextBrowser, QTableWidget { background-color: #3c3c3c; border: 1px solid #3c3c3c; color: #cccccc; padding: 4px;}
-            QGroupBox { border: 1px solid #3e3e42; border-radius: 4px; margin-top: 1.5em; font-weight: bold; color: #98c379; }
+            QLineEdit, QSpinBox, QTextEdit, QTextBrowser, QTableWidget { background-color: #3c3c3c; border: 1px solid #3c3c3c; color: #cccccc; padding: 1px;}
+            QGroupBox { border: 1px solid #3e3e42; border-radius: 4px; margin-top: 1.0em; font-weight: bold; color: #98c379; }
             QGroupBox::title { subcontrol-origin: margin; subcontrol-position: top left; padding: 0 5px; }
             QCheckBox::indicator { width: 14px; height: 14px; border: 1px solid #555; border-radius: 2px; background-color: #1e1e1e; }
             QCheckBox::indicator:checked { background-color: #98c379; border: 1px solid #98c379; }
