@@ -27,3 +27,12 @@ Processing amyloid models often involves tedious manual labor: fixing broken cha
 
 ## Author
 linkedin.com/in/songxian-ou-51bbab365
+
+![Image Alt](https://github.com/songxou0909/AmyloidModifier/blob/main/screenshot/1.png?raw=true)
+![Image Alt](https://github.com/songxou0909/AmyloidModifier/blob/main/screenshot/2.png?raw=true)
+![Image Alt](https://github.com/songxou0909/AmyloidModifier/blob/main/screenshot/3.png?raw=true)
+![Image Alt](https://github.com/songxou0909/AmyloidModifier/blob/main/screenshot/4.png?raw=true)
+![Image Alt](https://github.com/songxou0909/AmyloidModifier/blob/main/screenshot/5.png?raw=true)
+![Image Alt](https://github.com/songxou0909/AmyloidModifier/blob/main/screenshot/6.png?raw=true)
+![Image Alt](https://github.com/songxou0909/AmyloidModifier/blob/main/screenshot/7.png?raw=true)
+![Image Alt](https://github.com/songxou0909/AmyloidModifier/blob/main/screenshot/8.png?raw=true)
