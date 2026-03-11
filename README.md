@@ -30,7 +30,7 @@ Processing amyloid models often involves tedious manual labor: fixing broken cha
 **Expanding** is purely computed based on the calculated twist or rise of the current loaded model, the generated layers may not be as accurate as other tools that helical-expands based on density maps.
 
 ## Author
-Songxian Ou, Ruben's Lab
+Songxian Ou, Ruben Hervas Millan's Lab
 
 linkedin.com/in/songxian-ou-51bbab365
 
