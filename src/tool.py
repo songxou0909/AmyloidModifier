@@ -661,16 +661,15 @@ def open_chain_modifier():
             v_ops = QVBoxLayout()
 
             hb_trim = QHBoxLayout()
-            self.btn_trim = QPushButton("Trim Layers")
-            self.btn_trim.setToolTip("Trim the middle x layers")
+            self.btn_trim = QPushButton("Trim/Expand Layers")
+            self.btn_trim.setToolTip("Trim or expand the structure to the target number of layers")
             self.btn_trim.clicked.connect(self.action_trim)
             hb_trim.addWidget(self.btn_trim)
-            hb_trim.addWidget(QLabel("Keep the Middle"))
+            hb_trim.addWidget(QLabel("Target Layers:"))
             self.spin_trim = QSpinBox()
             self.spin_trim.setRange(1, 500)
             self.spin_trim.setValue(5)
             hb_trim.addWidget(self.spin_trim)
-            hb_trim.addWidget(QLabel("Layers"))
             v_ops.addLayout(hb_trim)
 
             hb_ren = QHBoxLayout()
@@ -797,15 +796,23 @@ def open_chain_modifier():
             if not target_z_planes: return set()
 
             het_atoms = []
+            molecule_map = {}
             with open(self.working_file_path, 'r') as f:
                 for i, line in enumerate(f):
                     if line.startswith("HETATM") or line.startswith("ATOM"):
                         res_name = line[17:20].strip()
                         chain_id = line[20:22].strip()
+                        res_seq = line[22:26].strip()
                         if chain_id in self.results: continue 
                         try:
                             x, y, z = float(line[30:38]), float(line[38:46]), float(line[46:54])
-                            het_atoms.append({'idx': i, 'x': x, 'y': y, 'z': z, 'res': res_name})
+                            atom_data = {'idx': i, 'x': x, 'y': y, 'z': z, 'res': res_name, 'chain': chain_id, 'res_seq': res_seq}
+                            het_atoms.append(atom_data)
+                            
+                            mol_key = (chain_id, res_seq)
+                            if mol_key not in molecule_map:
+                                molecule_map[mol_key] = []
+                            molecule_map[mol_key].append(i)
                         except: continue
 
             water_columns = [] 
@@ -837,7 +844,9 @@ def open_chain_modifier():
                             min_dist = dist
                             best_atom = atom
                     if best_atom and min_dist <= water_z_limit: 
-                        kept_line_indices.add(best_atom['idx'])
+                        mol_key = (best_atom['chain'], best_atom['res_seq'])
+                        for mol_idx in molecule_map[mol_key]:
+                            kept_line_indices.add(mol_idx)
 
             return kept_line_indices
 
@@ -903,7 +912,7 @@ def open_chain_modifier():
                         
                     if hasattr(first_model, 'id_string'):
                         self.working_model_id = first_model.id_string
-                        run(self.session, f"color #{self.working_model_id} bychain")
+                        run(self.session, f"color #{self.working_model_id} bypolymer")
                         run(self.session, f"view #{self.working_model_id}")
             except Exception as e:
                 self.text_area.append(f"\nModel display warning: {e}")
@@ -923,39 +932,527 @@ def open_chain_modifier():
                 self.process_pdb(self.working_file_path, old_sandwiches=old_sandwiches, rename_map=mapping)
             except Exception as e: QMessageBox.critical(self, "Error", f"Rename failed: {e}")
 
+        class ExpandDialog(QDialog):
+            def __init__(self, current_layers, parent=None):
+                super().__init__(parent)
+                self.setWindowTitle("Expand Layers")
+                self.current_layers = current_layers
+                self.initUI()
+                
+            def initUI(self):
+                layout = QVBoxLayout()
+                self.chk_auto = QCheckBox("Auto Computing")
+                self.chk_auto.setChecked(True)
+                layout.addWidget(self.chk_auto)
+                
+                self.chk_alt = QCheckBox("Alternating Layers (A-B-A-B)")
+                self.chk_alt.setToolTip("Expand using a 2-layer step to preserve alternating conformation differences.")
+                layout.addWidget(self.chk_alt)
+                
+                form_layout = QFormLayout()
+                self.edit_twist = QLineEdit("0.0")
+                self.edit_rise = QLineEdit("4.8")
+                self.edit_twist.setEnabled(False)
+                self.edit_rise.setEnabled(False)
+                self.edit_twist.setStyleSheet("color: gray;")
+                self.edit_rise.setStyleSheet("color: gray;")
+                
+                form_layout.addRow("Twist (°):", self.edit_twist)
+                form_layout.addRow("Rise (Å):", self.edit_rise)
+                layout.addLayout(form_layout)
+                
+                self.btn_expand = QPushButton("Expand")
+                self.btn_expand.clicked.connect(self.accept)
+                layout.addWidget(self.btn_expand)
+                self.setLayout(layout)
+                
+                self.chk_auto.stateChanged.connect(self.toggle_manual)
+                if self.current_layers <= 1:
+                    self.chk_auto.setChecked(False)
+                    self.chk_auto.setEnabled(False)
+                    self.chk_alt.setChecked(False)
+                    self.chk_alt.setEnabled(False)
+                    self.toggle_manual()
+                    
+            def toggle_manual(self):
+                is_auto = self.chk_auto.isChecked()
+                self.edit_twist.setEnabled(not is_auto)
+                self.edit_rise.setEnabled(not is_auto)
+                if is_auto:
+                    self.edit_twist.setStyleSheet("color: gray;")
+                    self.edit_rise.setStyleSheet("color: gray;")
+                else:
+                    self.edit_twist.setStyleSheet("")
+                    self.edit_rise.setStyleSheet("")
+
         def action_trim(self):
             if not self.working_file_path: return
             target_layers = self.spin_trim.value()
             total_layers = self.detected_layers
-            if target_layers >= total_layers:
-                self.text_area.append(f"\n[!] Trim skipped: Target ({target_layers}) >= Current ({total_layers})")
+            
+            if target_layers == total_layers:
+                self.text_area.append(f"\nYour model is already having {total_layers} layer(s)")
                 return
             
             try:
-                start_idx = (total_layers - target_layers) // 2
-                end_idx = start_idx + target_layers
-                valid_layer_indices = range(start_idx, end_idx)
-                
-                keep_chains = set()
-                for sandwich in self.final_sandwiches:
-                    for i, chain_id in enumerate(sandwich):
-                        if i in valid_layer_indices: keep_chains.add(chain_id)
-                
-                self.text_area.append("Calculating water/ion retention based on layer centroids...")
-                xy_lim = self.get_param(self.edit_xy_limit, 3.0)
-                water_z_limit = self.get_param(self.edit_water_z, 4.0)
-                keep_het_lines = self.get_kept_heteroatoms(valid_layer_indices, xy_lim, water_z_limit)
-                
                 new_temp = self.working_file_path + ".tmp"
-                self.write_trimmed_pdb(self.working_file_path, new_temp, keep_chains, keep_het_lines)
-                shutil.move(new_temp, self.working_file_path)
                 
-                self.text_area.append(f"\n>>>> Applied Trimming (Kept middle {target_layers} layers + associated waters)")
+                if target_layers < total_layers:
+                    start_idx = (total_layers - target_layers) // 2
+                    end_idx = start_idx + target_layers
+                    valid_layer_indices = range(start_idx, end_idx)
+                    
+                    keep_chains = set()
+                    for sandwich in self.final_sandwiches:
+                        for i, chain_id in enumerate(sandwich):
+                            if i in valid_layer_indices: keep_chains.add(chain_id)
+                    
+                    self.text_area.append("Calculating water/ion retention based on layer centroids...")
+                    xy_lim = self.get_param(self.edit_xy_limit, 3.0)
+                    water_z_limit = self.get_param(self.edit_water_z, 4.0)
+                    keep_het_lines = self.get_kept_heteroatoms(valid_layer_indices, xy_lim, water_z_limit)
+                    
+                    self.write_trimmed_pdb(self.working_file_path, new_temp, keep_chains, keep_het_lines)
+                    shutil.move(new_temp, self.working_file_path)
+                    self.text_area.append(f"\n>>>> Applied Trimming (Kept middle {target_layers} layers + associated waters)")
+                
+                else:
+                    is_anti = getattr(self, 'chk_anti', None) and self.chk_anti.isChecked()
+                    if is_anti:
+                        QMessageBox.warning(self, "Action Restricted", "Expansion is currently not supported in Anti-parallel mode. You can only trim layers.")
+                        return
+
+                    dialog = self.ExpandDialog(total_layers, self)
+                    if dialog.exec() != QDialog.DialogCode.Accepted:
+                        return
+                    
+                    use_auto = dialog.chk_auto.isChecked()
+                    use_alt = dialog.chk_alt.isChecked()
+                    manual_twist = 0.0
+                    manual_rise = 0.0
+                    if not use_auto:
+                        try:
+                            manual_twist = float(dialog.edit_twist.text())
+                            manual_rise = float(dialog.edit_rise.text())
+                        except ValueError:
+                            QMessageBox.warning(self, "Invalid Input", "Please enter valid numbers for Twist and Rise.")
+                            return
+
+                    self.text_area.append("Calculating expansion transformations...")
+                    layers_to_add = target_layers - total_layers
+                    water_z_limit = self.get_param(self.edit_water_z, 2.5)
+                    self.write_expanded_pdb(self.working_file_path, new_temp, layers_to_add, use_auto, manual_twist, manual_rise, water_z_limit, use_alt)
+                    shutil.move(new_temp, self.working_file_path)
+                    self.text_area.append(f"\n>>>> Applied Expansion (Added {layers_to_add} layers, Alternating: {use_alt})")
+
                 self.reload_working_model()
                 self.process_pdb(self.working_file_path)
                 
             except Exception as e: 
-                QMessageBox.critical(self, "Error", f"Trim failed: {e}")
+                QMessageBox.critical(self, "Error", f"Action failed: {e}")
+
+        def get_transform(self, coords_from, coords_to):
+            import numpy as np
+            min_len = min(len(coords_from), len(coords_to))
+            if min_len < 3:
+                return np.eye(3), np.zeros(3)
+            P = np.array(coords_from[:min_len])
+            Q = np.array(coords_to[:min_len])
+            centroid_P = np.mean(P, axis=0)
+            centroid_Q = np.mean(Q, axis=0)
+            P_centered = P - centroid_P
+            Q_centered = Q - centroid_Q
+            H = P_centered.T @ Q_centered
+            U, S, Vt = np.linalg.svd(H)
+            R = Vt.T @ U.T
+            if np.linalg.det(R) < 0:
+                Vt[2, :] *= -1
+                R = Vt.T @ U.T
+            t = centroid_Q - R @ centroid_P
+            return R, t
+
+        def write_expanded_pdb(self, input_path, output_path, layers_to_add, use_auto, manual_twist, manual_rise, water_z_limit=2.5, use_alt=False):
+            import numpy as np
+            import math
+            top_layers_to_add = layers_to_add // 2
+            bottom_layers_to_add = layers_to_add - top_layers_to_add
+
+            used_chain_ids = set()
+            max_res_seq = {} 
+            
+            orig_atoms_ters = []
+            orig_hetatms = []
+            headers = []
+            orig_conects = []
+
+            with open(input_path, 'r') as fin:
+                for line in fin:
+                    if line.startswith("MASTER") or line.startswith("END") or line.startswith("SEQRES") or line.startswith("SHEET") or line.startswith("HELIX"):
+                        continue
+                    elif line.startswith("ATOM") or line.startswith("TER") or line.startswith("ANISOU"):
+                        orig_atoms_ters.append(line)
+                        if len(line) >= 22:
+                            chain_id = line[20:22].strip()
+                            used_chain_ids.add(chain_id)
+                    elif line.startswith("HETATM"):
+                        orig_hetatms.append(line)
+                    elif line.startswith("CONECT"):
+                        orig_conects.append(line)
+                    else:
+                        headers.append(line)
+
+            het_types = set()
+            for line in orig_hetatms:
+                if len(line) >= 20:
+                    het_types.add(line[17:20].strip())
+            
+            reserved_het_chains = {}
+            alphabet_backwards = "ZYXWVUTSRQPONMLKJIHGFEDCBA"
+            for i, htype in enumerate(sorted(list(het_types))):
+                if i < len(alphabet_backwards):
+                    c = alphabet_backwards[i]
+                    reserved_het_chains[htype] = c
+                    used_chain_ids.add(c)
+            
+            updated_orig_hetatms = []
+            het_counters = {c: 1 for c in reserved_het_chains.values()}
+            het_molecule_map = {}
+            
+            for line in orig_hetatms:
+                if len(line) < 26:
+                    updated_orig_hetatms.append(line)
+                    continue
+                res_name = line[17:20].strip()
+                if res_name in reserved_het_chains:
+                    new_chain = reserved_het_chains[res_name]
+                    orig_chain = line[20:22].strip()
+                    try: orig_res_seq = int(line[22:26])
+                    except: orig_res_seq = line[22:26]
+                    
+                    mol_key = (orig_chain, orig_res_seq, res_name)
+                    if mol_key not in het_molecule_map:
+                        het_molecule_map[mol_key] = het_counters[new_chain]
+                        het_counters[new_chain] += 1
+                        
+                    new_seq = het_molecule_map[mol_key]
+                    max_res_seq[new_chain] = new_seq
+                    
+                    l = list(line)
+                    l[21] = new_chain; l[20] = ' '
+                    l[22:26] = list(f"{new_seq:>4}")
+                    updated_orig_hetatms.append("".join(l))
+                else:
+                    updated_orig_hetatms.append(line)
+                    
+            orig_hetatms = updated_orig_hetatms
+            
+            def get_new_chain_id():
+                idx = 0
+                while True:
+                    label = self.generate_label(idx)
+                    if label not in used_chain_ids:
+                        used_chain_ids.add(label)
+                        return label
+                    idx += 1
+
+            core_chains = set()
+            for s in self.final_sandwiches:
+                core_chains.update(s)
+
+            chain_atoms = {}
+            chain_ca_coords = {}
+            standalone_atoms = orig_hetatms 
+            
+            for line in orig_atoms_ters:
+                if line.startswith("ATOM") and len(line) >= 54:
+                    chain_id = line[20:22].strip()
+                    if chain_id in core_chains:
+                        if chain_id not in chain_atoms:
+                            chain_atoms[chain_id] = []
+                            chain_ca_coords[chain_id] = []
+                        chain_atoms[chain_id].append(line)
+                        if line[12:16].strip() == "CA":
+                            try:
+                                x, y, z = float(line[30:38]), float(line[38:46]), float(line[46:54])
+                                chain_ca_coords[chain_id].append([x, y, z])
+                            except ValueError: pass
+
+            chain_centroids = {}
+            for cid, coords in chain_ca_coords.items():
+                if coords:
+                    chain_centroids[cid] = np.mean(coords, axis=0)
+                    
+            core_ca_coords = []
+            for cid in core_chains:
+                if cid in chain_ca_coords:
+                    core_ca_coords.extend(chain_ca_coords[cid])
+            global_centroid = np.mean(core_ca_coords, axis=0) if core_ca_coords else np.zeros(3)
+
+            associated_atoms = {cid: [] for cid in core_chains}
+            for line in standalone_atoms:
+                if len(line) < 54: continue
+                try:
+                    x, y, z = float(line[30:38]), float(line[38:46]), float(line[46:54])
+                    best_chain = None
+                    min_dist = float('inf')
+                    for cid, centroid in chain_centroids.items():
+                        dz = abs(z - centroid[2])
+                        if dz <= water_z_limit:
+                            dist = math.sqrt((x - centroid[0])**2 + (y - centroid[1])**2 + (z - centroid[2])**2)
+                            if dist < min_dist:
+                                min_dist = dist
+                                best_chain = cid
+                    if best_chain:
+                        associated_atoms[best_chain].append(line)
+                except ValueError:
+                    pass
+
+            expansions = [] 
+            for sandwich in self.final_sandwiches:
+                if len(sandwich) == 0: continue
+                
+                bottom_chain = sandwich[0]
+                top_chain = sandwich[-1]
+                
+                if use_alt:
+                    # Alternating expansion (A-B-A-B). Uses a 2-layer step transform.
+                    if use_auto:
+                        if len(sandwich) >= 3:
+                            # Calculate a 2-layer step directly
+                            R_top, t_top = self.get_transform(chain_ca_coords[sandwich[-3]], chain_ca_coords[top_chain])
+                            R_bottom, t_bottom = self.get_transform(chain_ca_coords[sandwich[2]], chain_ca_coords[bottom_chain])
+                        elif len(sandwich) == 2:
+                            # Square the 1-layer transform to approximate a 2-layer step if only 2 layers exist
+                            R_t1, t_t1 = self.get_transform(chain_ca_coords[sandwich[-2]], chain_ca_coords[top_chain])
+                            R_top = R_t1 @ R_t1
+                            t_top = R_t1 @ t_t1 + t_t1
+                            R_b1, t_b1 = self.get_transform(chain_ca_coords[sandwich[1]], chain_ca_coords[bottom_chain])
+                            R_bottom = R_b1 @ R_b1
+                            t_bottom = R_b1 @ t_b1 + t_b1
+                        else:
+                            R_top, t_top = np.eye(3), np.zeros(3)
+                            R_bottom, t_bottom = np.eye(3), np.zeros(3)
+                    else:
+                        rad = math.radians(manual_twist * 2.0)
+                        cos_t, sin_t = math.cos(rad), math.sin(rad)
+                        rise = manual_rise * 2.0
+                        R_top = np.array([[cos_t, -sin_t, 0], [sin_t, cos_t, 0], [0, 0, 1]])
+                        base_t_top = np.array([0.0, 0.0, rise])
+                        t_top = global_centroid - R_top @ global_centroid + base_t_top
+                        
+                        R_bottom = np.array([[cos_t, sin_t, 0], [-sin_t, cos_t, 0], [0, 0, 1]])
+                        base_t_bottom = np.array([0.0, 0.0, -rise])
+                        t_bottom = global_centroid - R_bottom @ global_centroid + base_t_bottom
+                    
+                    if len(sandwich) >= 2:
+                        prev_b1 = sandwich[1]
+                        prev_b2 = sandwich[0]
+                    else:
+                        prev_b1 = prev_b2 = sandwich[0]
+                        
+                    for _ in range(bottom_layers_to_add):
+                        new_chain_id = get_new_chain_id()
+                        expansions.append((prev_b1, new_chain_id, R_bottom, t_bottom))
+                        prev_b1 = prev_b2
+                        prev_b2 = new_chain_id
+
+                    if len(sandwich) >= 2:
+                        prev_t1 = sandwich[-2]
+                        prev_t2 = sandwich[-1]
+                    else:
+                        prev_t1 = prev_t2 = sandwich[-1]
+                        
+                    for _ in range(top_layers_to_add):
+                        new_chain_id = get_new_chain_id()
+                        expansions.append((prev_t1, new_chain_id, R_top, t_top))
+                        prev_t1 = prev_t2
+                        prev_t2 = new_chain_id
+
+                else:
+                    if use_auto and len(sandwich) >= 2:
+                        bottom_next = sandwich[1]
+                        R_bottom, t_bottom = self.get_transform(chain_ca_coords[bottom_next], chain_ca_coords[bottom_chain])
+                        top_prev = sandwich[-2]
+                        R_top, t_top = self.get_transform(chain_ca_coords[top_prev], chain_ca_coords[top_chain])
+                    else:
+                        rad = math.radians(manual_twist)
+                        cos_t = math.cos(rad)
+                        sin_t = math.sin(rad)
+                        R_top = np.array([[cos_t, -sin_t, 0], [sin_t, cos_t, 0], [0, 0, 1]])
+                        base_t_top = np.array([0.0, 0.0, manual_rise])
+                        t_top = global_centroid - R_top @ global_centroid + base_t_top
+                        
+                        R_bottom = np.array([[cos_t, sin_t, 0], [-sin_t, cos_t, 0], [0, 0, 1]])
+                        base_t_bottom = np.array([0.0, 0.0, -manual_rise])
+                        t_bottom = global_centroid - R_bottom @ global_centroid + base_t_bottom
+                    
+                    current_ref_chain = bottom_chain
+                    for _ in range(bottom_layers_to_add):
+                        new_chain_id = get_new_chain_id()
+                        expansions.append((current_ref_chain, new_chain_id, R_bottom, t_bottom))
+                        current_ref_chain = new_chain_id
+                        
+                    current_ref_chain = top_chain
+                    for _ in range(top_layers_to_add):
+                        new_chain_id = get_new_chain_id()
+                        expansions.append((current_ref_chain, new_chain_id, R_top, t_top))
+                        current_ref_chain = new_chain_id
+
+            new_chain_lines = {}
+            all_new_hetatms = []
+
+            for ref_chain, new_chain, R, t in expansions:
+                lines = chain_atoms.get(ref_chain, [])
+                new_lines = []
+                for line in lines:
+                    try:
+                        orig_x = float(line[30:38])
+                        orig_y = float(line[38:46])
+                        orig_z = float(line[46:54])
+                        orig_vec = np.array([orig_x, orig_y, orig_z])
+                        new_vec = R @ orig_vec + t
+                        
+                        l = list(line)
+                        if len(new_chain) == 1:
+                            l[21] = new_chain; l[20] = ' '
+                        elif len(new_chain) >= 2:
+                            l[20] = new_chain[0]; l[21] = new_chain[1]
+                        
+                        l[30:38] = list(f"{new_vec[0]:8.3f}")
+                        l[38:46] = list(f"{new_vec[1]:8.3f}")
+                        l[46:54] = list(f"{new_vec[2]:8.3f}")
+                        
+                        new_lines.append("".join(l))
+                    except Exception:
+                        new_lines.append(line)
+                chain_atoms[new_chain] = new_lines
+                new_chain_lines[new_chain] = new_lines
+
+                het_lines = associated_atoms.get(ref_chain, [])
+                het_res_map = {} 
+                new_het_lines_for_next = []
+                
+                for line in het_lines:
+                    try:
+                        orig_x = float(line[30:38])
+                        orig_y = float(line[38:46])
+                        orig_z = float(line[46:54])
+                        orig_vec = np.array([orig_x, orig_y, orig_z])
+                        new_vec = R @ orig_vec + t
+                        
+                        l = list(line)
+                        
+                        orig_chain = line[20:22].strip()
+                        orig_res_seq = int(line[22:26])
+                        
+                        res_key = (orig_chain, orig_res_seq)
+                        if res_key not in het_res_map:
+                            max_res_seq[orig_chain] = max_res_seq.get(orig_chain, 0) + 1
+                            het_res_map[res_key] = max_res_seq[orig_chain]
+                            
+                        new_res_seq = het_res_map[res_key]
+                        
+                        if len(new_chain) == 1:
+                            l[21] = new_chain; l[20] = ' '
+                        elif len(new_chain) >= 2:
+                            l[20] = new_chain[0]; l[21] = new_chain[1]
+                            
+                        l[22:26] = list(f"{new_res_seq:>4}")
+                        l[30:38] = list(f"{new_vec[0]:8.3f}")
+                        l[38:46] = list(f"{new_vec[1]:8.3f}")
+                        l[46:54] = list(f"{new_vec[2]:8.3f}")
+                        
+                        new_line_str = "".join(l)
+                        all_new_hetatms.append(new_line_str)
+                        new_het_lines_for_next.append(new_line_str)
+                    except Exception:
+                        all_new_hetatms.append(line)
+                        new_het_lines_for_next.append(line)
+                
+                associated_atoms[new_chain] = new_het_lines_for_next
+
+            all_new_hetatms.sort(key=lambda line: (line[20:22], int(line[22:26]) if line[22:26].strip().isdigit() else 0))
+
+            serial_counter = 1
+            serial_map = {}
+
+            with open(output_path, 'w') as fout:
+                for line in headers:
+                    fout.write(line)
+                    
+                for line in orig_atoms_ters:
+                    try:
+                        old_serial = int(line[6:11])
+                        l = list(line)
+                        l[6:11] = list(f"{serial_counter:>5}")
+                        fout.write("".join(l))
+                        serial_map[old_serial] = serial_counter
+                        serial_counter += 1
+                    except: fout.write(line)
+                
+                for ref_chain, new_chain, R, t in expansions:
+                    last_line = ""
+                    for line in new_chain_lines[new_chain]:
+                        try:
+                            l = list(line)
+                            l[6:11] = list(f"{serial_counter:>5}")
+                            fout.write("".join(l))
+                            serial_counter += 1
+                            last_line = line
+                        except: fout.write(line)
+                    
+                    if last_line:
+                        ter_line = list("TER   " + " " * 74)
+                        ter_line[6:11] = list(f"{serial_counter:>5}")
+                        ter_line[17:20] = list(last_line[17:20]) 
+                        ter_line[20:22] = list(last_line[20:22]) 
+                        ter_line[22:26] = list(last_line[22:26]) 
+                        ter_line[26] = last_line[26]             
+                        fout.write("".join(ter_line).rstrip() + "\n")
+                        serial_counter += 1
+                
+                for line in orig_hetatms:
+                    try:
+                        old_serial = int(line[6:11])
+                        l = list(line)
+                        l[6:11] = list(f"{serial_counter:>5}")
+                        fout.write("".join(l))
+                        serial_map[old_serial] = serial_counter
+                        serial_counter += 1
+                    except: fout.write(line)
+
+                for line in all_new_hetatms:
+                    try:
+                        l = list(line)
+                        l[6:11] = list(f"{serial_counter:>5}")
+                        fout.write("".join(l))
+                        serial_counter += 1
+                    except: fout.write(line)
+
+                for line in orig_conects:
+                    try:
+                        parts = line.split()
+                        if len(parts) < 2: continue
+                        old_source = int(parts[1])
+                        if old_source not in serial_map: continue
+                        new_source = serial_map[old_source]
+                        
+                        valid_targets = []
+                        for p in parts[2:]:
+                            try:
+                                tgt_old = int(p)
+                                if tgt_old in serial_map:
+                                    valid_targets.append(serial_map[tgt_old])
+                            except: pass
+                        
+                        if valid_targets:
+                            out_line = "CONECT" + f"{new_source:>5}"
+                            for tgt in valid_targets:
+                                out_line += f"{tgt:>5}"
+                            fout.write(out_line + "\n")
+                    except: pass
+                    
+                fout.write("END   \n")
 
         def action_restrain(self):
             if not self.final_sandwiches or self.detected_layers == 0: return
@@ -1048,8 +1545,12 @@ def open_chain_modifier():
                         current_label = self.generate_label(current_segment_idx)
                     if line.startswith("ATOM") or line.startswith("HETATM"):
                         line_list = list(line)
-                        if len(current_label) == 1: line_list[21] = current_label
-                        elif len(current_label) > 1: line_list[21] = current_label[0]
+                        if len(current_label) == 1: 
+                            line_list[21] = current_label
+                            line_list[20] = ' '
+                        elif len(current_label) >= 2: 
+                            line_list[20] = current_label[0]
+                            line_list[21] = current_label[1]
                         fout.write("".join(line_list))
                     else:
                         fout.write(line)
@@ -1452,19 +1953,36 @@ def open_chain_modifier():
         def create_renaming_mapping(self, sandwiches):
             n_layers = self.detected_layers
             layer_order = self.get_expansion_order(n_layers)
+            
+            skip_chars = set()
+            if self.working_file_path:
+                het_types = set()
+                try:
+                    with open(self.working_file_path, 'r') as f:
+                        for line in f:
+                            if line.startswith("HETATM") and len(line) >= 20:
+                                het_types.add(line[17:20].strip())
+                    alphabet_backwards = "ZYXWVUTSRQPONMLKJIHGFEDCBA"
+                    for i, htype in enumerate(sorted(list(het_types))):
+                        if i < len(alphabet_backwards):
+                            skip_chars.add(alphabet_backwards[i])
+                except: pass
+
             mapping = {}; global_index = 0
             for layer_idx in layer_order:
                 for sandwich in sandwiches:
                     if layer_idx < len(sandwich):
                         chain_id = sandwich[layer_idx]
-                        new_label = self.generate_label(global_index)
+                        while True:
+                            new_label = self.generate_label(global_index)
+                            global_index += 1
+                            if new_label not in skip_chars:
+                                break
                         mapping[chain_id] = new_label
-                        global_index += 1
             return mapping
 
         def write_renamed_pdb(self, input_filename, output_filename, sandwiches):
             prot_mapping = self.create_renaming_mapping(sandwiches)
-            used_ids = set(prot_mapping.values())
             het_types = set()
             with open(input_filename, 'r') as f:
                 for line in f:
@@ -1472,18 +1990,10 @@ def open_chain_modifier():
                         het_types.add(line[17:20].strip())
             
             het_type_map = {}
-            def gen_id(idx): return self.generate_label(idx)
-            next_idx = 0
-            sorted_types = sorted(list(het_types))
-            
-            for htype in sorted_types:
-                while True:
-                    candidate = gen_id(next_idx)
-                    next_idx += 1
-                    if candidate not in used_ids:
-                        het_type_map[htype] = candidate
-                        used_ids.add(candidate)
-                        break
+            alphabet_backwards = "ZYXWVUTSRQPONMLKJIHGFEDCBA"
+            for i, htype in enumerate(sorted(list(het_types))):
+                if i < len(alphabet_backwards):
+                    het_type_map[htype] = alphabet_backwards[i]
 
             het_counters = {cid: 1 for cid in het_type_map.values()}
             last_seen_residue = {cid: (None, None) for cid in het_type_map.values()}
