@@ -5,7 +5,7 @@
 
   <Author>Songxian Ou</Author>
   <Email>songx09@connect.hku.hk</Email>
-  <URL>https://www.linkedin.com/in/songxian-ou-51bbab365/?originalSubdomain=hk</URL>
+  <URL>linkedin.com/in/songxian-ou-51bbab365</URL>
 
   <Synopsis>A GUI tool for analyzing, trimming, and renaming multi-layer amyloid fibril structures.</Synopsis>
   <Description>
@@ -29,3 +29,4 @@
   </Classifiers>
   
 </BundleInfo>
+
