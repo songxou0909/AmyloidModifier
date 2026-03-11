@@ -7,7 +7,7 @@ Processing amyloid models often involves tedious manual labor: fixing broken cha
 ## Key Features
 
 * **Intelligent Layer Detection:** Automatically detects protofilaments and horizontal layers using customizable spatial parameters (Z-Shift and XY-Shift limits), supporting both parallel and anti-parallel amyloid arrangements.
-* **Automated Trimming:** Easily trim your fibril to a specific number of central layers. The tool intelligently retains associated waters and ions while discarding ragged edges.
+* **Automated Trimming/Expanding:** Easily trim/expand your fibril to a specific number of central layers. The tool intelligently retains associated waters and ions while discarding ragged edges.
 * **Smart Chain Renaming:** Systematically rename chains from the middle out (e.g., A, B, C... or 0, 1, 2...) to ensure standardized nomenclature. Automatically resolves duplicate or broken chain IDs.
 * **ISOLDE Restraint Generation:** Export a `.cxc` command file to apply ISOLDE torsion restraints. It automatically restrains the outer layers of the fibril using the central layer as a structural template.
 * **Secondary Structure Re-evaluation:** Seamlessly triggers ChimeraX's built-in `dssp` algorithm to recalculate and annotate β-sheet as you click
@@ -24,6 +24,10 @@ Processing amyloid models often involves tedious manual labor: fixing broken cha
 5. **Rename Chains:** Click **Rename Chains** to standardize your nomenclature from the center outwards.
 6. **Evaluate:** Click **Re-evaluate β-sheet structure** to update the secondary structure headers.
 7. **Export Restraints:** (Optional) Click **Generate Restrain File** to export an ISOLDE `.cxc` script.
+
+## Disclaimer
+**Trimming** only occurs to chain related entries, e.g., ATOM, HETATM..., chain-unrelated entries such as AUTHOR, REMARKS... will not be modified.
+**Expanding** is purely computed based on the calculated twist or rise of the current loaded model, the generated layers may not be as accurate as other tools that helical-expands based on density maps.
 
 ## Author
 Songxian Ou, Ruben's Lab
