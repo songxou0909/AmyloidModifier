@@ -26,6 +26,8 @@ Processing amyloid models often involves tedious manual labor: fixing broken cha
 7. **Export Restraints:** (Optional) Click **Generate Restrain File** to export an ISOLDE `.cxc` script.
 
 ## Author
+Songxian Ou, Ruben's Lab
+
 linkedin.com/in/songxian-ou-51bbab365
 
 ![Image Alt](https://github.com/songxou0909/AmyloidModifier/blob/main/screenshot/1.png?raw=true)
