@@ -1,11 +1,11 @@
 <BundleInfo name="ChimeraX-AmyloidModifier"
-            version="1.3"
+            version="1.4"
             package="chimerax.amyloidmodifier"
             minSessionVersion="1" maxSessionVersion="1">
 
   <Author>Songxian Ou</Author>
   <Email>songx09@connect.hku.hk</Email>
-  <URL>linkedin.com/in/songxian-ou-51bbab365</URL>
+  <URL>https://www.linkedin.com/in/songxian-ou-51bbab365/?originalSubdomain=hk</URL>
 
   <Synopsis>A GUI tool for analyzing, trimming, and renaming multi-layer amyloid fibril structures.</Synopsis>
   <Description>
@@ -29,4 +29,3 @@
   </Classifiers>
   
 </BundleInfo>
-
