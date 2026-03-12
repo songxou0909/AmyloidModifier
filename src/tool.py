@@ -2,7 +2,6 @@ import os
 import math
 import shutil
 import atexit
-import uuid
 
 from PyQt6.QtWidgets import (QApplication, QWidget, QLabel, QLineEdit, 
                              QPushButton, QTextEdit, QMessageBox, QFileDialog, 
@@ -375,11 +374,13 @@ def open_chain_modifier():
             
             hb_load = QHBoxLayout()
             self.cmb_models = QComboBox()
+            self.cmb_models.wheelEvent = lambda event: event.ignore()
             self.populate_models()
             hb_load.addWidget(self.cmb_models)
             
             self.auto_refresh_timer = QTimer(self)
             self.auto_refresh_timer.timeout.connect(self.populate_models)
+            self.auto_refresh_timer.timeout.connect(self.check_live_edits)
             self.auto_refresh_timer.start(1000)
             
             self.btn_load_model = QPushButton('Load Model')
@@ -424,6 +425,42 @@ def open_chain_modifier():
             splitter.setStretchFactor(0, 5); splitter.setStretchFactor(1, 5)
             main_l.addWidget(splitter); self.setLayout(main_l)
 
+        def sync_viewer_to_file(self):
+            """Silently saves the live ChimeraX model back to the working CIF file."""
+            if getattr(self, 'working_model_id', None) and self.working_file_path:
+                from chimerax.core.commands import run
+                try:
+                    run(self.session, f'save "{self.working_file_path}" models #{self.working_model_id} format mmcif')
+                except Exception:
+                    pass
+
+        def check_live_edits(self):
+            """Silently checks if the user natively deleted atoms and auto-syncs the CIF viewer."""
+            if not getattr(self, 'working_model_id', None): return
+            try:
+                from chimerax.atomic import AtomicStructure
+                found = False
+                for m in self.session.models.list(type=AtomicStructure):
+                    if m.id_string == self.working_model_id:
+                        found = True
+                        current_atoms = len(m.atoms)
+                        if getattr(self, '_last_live_atom_count', -1) != current_atoms:
+                            self._last_live_atom_count = current_atoms
+                            self.sync_viewer_to_file()
+                            self.process_cif(self.working_file_path)
+                        break
+                
+                if not found:
+                    self.working_model_id = None
+                    self.working_file_path = None
+                    self.grp_ops.setEnabled(False)
+                    self.cvs.axes.clear()
+                    self.cvs.axes.axis('off')
+                    self.cvs.draw()
+                    self.txt.append("<br><b>>>> Working model was closed in ChimeraX. Tool cleared.</b><br>")
+            except Exception:
+                pass
+
         def populate_models(self):
             from chimerax.atomic import AtomicStructure
             current_models = self.session.models.list(type=AtomicStructure)
@@ -434,6 +471,9 @@ def open_chain_modifier():
                     current_sel_id = current_sel.id_string if current_sel and not getattr(current_sel, 'deleted', False) else None
                 except Exception:
                     current_sel_id = None
+                    
+                if not current_sel_id and getattr(self, 'working_model_id', None):
+                    current_sel_id = self.working_model_id
                     
                 self.cmb_models.blockSignals(True)
                 self.cmb_models.clear()
@@ -448,30 +488,71 @@ def open_chain_modifier():
                 self.cmb_models.blockSignals(False)
                 self._last_model_ids = current_ids
 
+        def reload_working_model(self):
+            target_id = getattr(self, 'working_model_id', None)
+            try:
+                from chimerax.core.commands import run
+                
+                try: run(self.session, "view name chimerax_modifier_locked_view")
+                except: pass
+                
+                if target_id:
+                    try: run(self.session, f"close #{target_id}")
+                    except: pass
+                    models = run(self.session, f'open "{self.working_file_path}" id {target_id.split(".")[0]}')
+                else:
+                    models = run(self.session, f'open "{self.working_file_path}"')
+                    
+                if models:
+                    first_item = models[0]
+                    first_model = first_item[0] if isinstance(first_item, (list, tuple)) else first_item
+                    if hasattr(first_model, 'id_string'):
+                        self.working_model_id = first_model.id_string
+                        self._last_live_atom_count = len(first_model.atoms) if hasattr(first_model, 'atoms') else 0
+                        run(self.session, f"color #{self.working_model_id} bypolymer")
+                
+                try: run(self.session, "view chimerax_modifier_locked_view")
+                except: pass
+                
+            except Exception as e:
+                self.txt.append(f"\nModel display warning: {e}")
+
         def load_from_chimerax(self):
             model = self.cmb_models.currentData()
             if not model: return
             try:
                 self.loaded_filename = model.name
-                self.lbl_status.setText(f"Loaded: {self.loaded_filename}")
-                
                 folder = os.path.join(os.path.expanduser("~"), ".chimerax_modifier_temp")
                 os.makedirs(folder, exist_ok=True)
-                unique_suffix = uuid.uuid4().hex[:8]
-                temp_path = os.path.join(folder, f"working_copy_{unique_suffix}.cif")
+                
+                name_part, _ = os.path.splitext(self.loaded_filename)
+                temp_path = os.path.join(folder, f"{name_part}_modified.cif")
                 
                 run(self.session, f'save "{temp_path}" models #{model.id_string} format mmcif')
                 self.created_temp_files.append(temp_path)
-                
                 self.working_file_path = temp_path
                 self.grp_ops.setEnabled(True)
-                self.txt.clear(); self.txt.append(f"Loaded {model.name}")
+                
+                self.working_model_id = None
+                self.reload_working_model()
+                
+                self.lbl_status.setText(f"Loaded: {name_part}_modified.cif")
+                self.txt.clear(); self.txt.append(f"Created CIF working copy from {model.name}")
                 self.process_cif(temp_path)
+                
+                self.populate_models()
+                for i in range(self.cmb_models.count()):
+                    m = self.cmb_models.itemData(i)
+                    if m and getattr(m, 'id_string', '') == getattr(self, 'working_model_id', ''):
+                        self.cmb_models.setCurrentIndex(i)
+                        break
             except Exception as e:
                 self.txt.append(f"Load Error: {e}")
 
         def recalc(self):
-            if self.working_file_path: QTimer.singleShot(10, lambda: self.process_cif(self.working_file_path))
+            if self.working_file_path: 
+                self.sync_viewer_to_file()
+                QTimer.singleShot(10, lambda: self.process_cif(self.working_file_path))
 
         def link_clk(self, url):
             try:
@@ -623,11 +704,13 @@ def open_chain_modifier():
 
             hb_load = QHBoxLayout()
             self.cmb_models = QComboBox()
+            self.cmb_models.wheelEvent = lambda event: event.ignore()
             self.populate_models()
             hb_load.addWidget(self.cmb_models)
             
             self.auto_refresh_timer = QTimer(self)
             self.auto_refresh_timer.timeout.connect(self.populate_models)
+            self.auto_refresh_timer.timeout.connect(self.check_live_edits)
             self.auto_refresh_timer.start(1000)
             
             self.btn_load_model = QPushButton('Load Model')
@@ -732,7 +815,7 @@ def open_chain_modifier():
             params_layout.addRow("XY Shift Limit (Å):", self.edit_xy_limit)
             self.edit_neighbor_count = create_param_input(6, "How many closest chains to search for stacking each time", is_int=True)
             params_layout.addRow("Neighbor Search Count:", self.edit_neighbor_count)
-            self.edit_water_z = create_param_input(2.5, "Maximum vertical distance from the protein layer centroids for a water/ion to be included")
+            self.edit_water_z = create_param_input(4.0, "Maximum vertical distance from the protein layer centroids for a water/ion to be included")
             params_layout.addRow("Water/Ion Z Shift:", self.edit_water_z)
 
             self.grp_params.setLayout(params_layout)
@@ -778,8 +861,18 @@ def open_chain_modifier():
             main_layout.addWidget(splitter)
             self.setLayout(main_layout)
         
+        def sync_viewer_to_file(self):
+            """Silently saves the live ChimeraX model back to the working file."""
+            if self.working_model_id and self.working_file_path:
+                from chimerax.core.commands import run
+                try:
+                    run(self.session, f'save "{self.working_file_path}" models #{self.working_model_id} format pdb')
+                except Exception:
+                    pass
+
         def on_param_change(self):
             if self.working_file_path:
+                self.sync_viewer_to_file()
                 self.text_area.append("\n--- Parameters changed: Re-calculating ---")
                 QTimer.singleShot(10, lambda: self.process_pdb(self.working_file_path))
 
@@ -861,6 +954,33 @@ def open_chain_modifier():
 
             return kept_line_indices
 
+        def check_live_edits(self):
+            """Silently checks if the user natively deleted atoms in ChimeraX and auto-syncs the Python 3D viewer."""
+            if not getattr(self, 'working_model_id', None): return
+            try:
+                from chimerax.atomic import AtomicStructure
+                found = False
+                for m in self.session.models.list(type=AtomicStructure):
+                    if m.id_string == self.working_model_id:
+                        found = True
+                        current_atoms = len(m.atoms)
+                        if getattr(self, '_last_live_atom_count', -1) != current_atoms:
+                            self._last_live_atom_count = current_atoms
+                            self.sync_viewer_to_file()
+                            self.process_pdb(self.working_file_path)
+                        break
+                
+                if not found:
+                    self.working_model_id = None
+                    self.working_file_path = None
+                    self.grp_ops.setEnabled(False)
+                    self.mol_canvas.axes.clear()
+                    self.mol_canvas.axes.axis('off')
+                    self.mol_canvas.draw()
+                    self.text_area.append("\n>>> Working model was closed in ChimeraX. Tool cleared.")
+            except Exception:
+                pass
+
         def populate_models(self):
             from chimerax.atomic import AtomicStructure
             current_models = self.session.models.list(type=AtomicStructure)
@@ -872,6 +992,9 @@ def open_chain_modifier():
                     current_sel_id = current_sel.id_string if current_sel and not getattr(current_sel, 'deleted', False) else None
                 except Exception:
                     current_sel_id = None
+                
+                if not current_sel_id and getattr(self, 'working_model_id', None):
+                    current_sel_id = self.working_model_id
                 
                 self.cmb_models.blockSignals(True)
                 self.cmb_models.clear()
@@ -913,29 +1036,51 @@ def open_chain_modifier():
                 self.text_area.append(f"Created PDB working copy from {model.name}")
                 self.check_spatial_and_id_duplicates(self.working_file_path)
                 self.process_pdb(self.working_file_path)
+                
+                self.populate_models()
+                for i in range(self.cmb_models.count()):
+                    m = self.cmb_models.itemData(i)
+                    if m and getattr(m, 'id_string', '') == self.working_model_id:
+                        self.cmb_models.setCurrentIndex(i)
+                        break
+                        
             except Exception as e:
                 self.text_area.append(f"Load Error: {e}")
 
         def reload_working_model(self):
-            if self.working_model_id:
-                try: run(self.session, f"close #{self.working_model_id}")
+            target_id = self.working_model_id
+            
+            try:
+                from chimerax.core.commands import run
+                
+                try: run(self.session, "view name chimerax_modifier_locked_view")
                 except: pass
                 
-            try:
-                models = run(self.session, f'open "{self.working_file_path}"')
+                if target_id:
+                    try: run(self.session, f"close #{target_id}")
+                    except: pass
+                    models = run(self.session, f'open "{self.working_file_path}" id {target_id.split(".")[0]}')
+                else:
+                    models = run(self.session, f'open "{self.working_file_path}"')
+                    
                 if models:
                     first_item = models[0]
                     first_model = first_item[0] if isinstance(first_item, (list, tuple)) else first_item
                         
                     if hasattr(first_model, 'id_string'):
                         self.working_model_id = first_model.id_string
+                        self._last_live_atom_count = len(first_model.atoms) if hasattr(first_model, 'atoms') else 0
                         run(self.session, f"color #{self.working_model_id} bypolymer")
-                        run(self.session, f"view #{self.working_model_id}")
+                
+                try: run(self.session, "view chimerax_modifier_locked_view")
+                except: pass
+                        
             except Exception as e:
                 self.text_area.append(f"\nModel display warning: {e}")
 
         def action_rename(self):
             if not self.working_file_path: return
+            self.sync_viewer_to_file()
             try:
                 old_sandwiches = self.final_sandwiches
                 mapping = self.create_renaming_mapping(old_sandwiches)
@@ -1004,6 +1149,7 @@ def open_chain_modifier():
 
         def action_trim(self):
             if not self.working_file_path: return
+            self.sync_viewer_to_file()
             try:
                 target_layers = int(self.edit_trim.text())
             except ValueError:
@@ -1062,7 +1208,7 @@ def open_chain_modifier():
 
                     self.text_area.append("Calculating expansion transformations...")
                     layers_to_add = target_layers - total_layers
-                    water_z_limit = self.get_param(self.edit_water_z, 2.5)
+                    water_z_limit = self.get_param(self.edit_water_z, 4.0)
                     applied_twist, applied_rise = self.write_expanded_pdb(self.working_file_path, new_temp, layers_to_add, use_auto, manual_twist, manual_rise, water_z_limit, use_alt)
                     shutil.move(new_temp, self.working_file_path)
                     self.text_area.append(f"\n>>>> Applied Expansion (Added {layers_to_add} layers, Alternating: {use_alt})")
@@ -1097,7 +1243,7 @@ def open_chain_modifier():
             t = centroid_Q - R @ centroid_P
             return R, t
 
-        def write_expanded_pdb(self, input_path, output_path, layers_to_add, use_auto, manual_twist, manual_rise, water_z_limit=2.5, use_alt=False):
+        def write_expanded_pdb(self, input_path, output_path, layers_to_add, use_auto, manual_twist, manual_rise, water_z_limit=4.0, use_alt=False):
             import numpy as np
             import math
             top_layers_to_add = layers_to_add // 2
@@ -1396,11 +1542,6 @@ def open_chain_modifier():
                             
                         new_res_seq = het_res_map[res_key]
                         
-                        if len(new_chain) == 1:
-                            l[21] = new_chain; l[20] = ' '
-                        elif len(new_chain) >= 2:
-                            l[20] = new_chain[0]; l[21] = new_chain[1]
-                            
                         l[22:26] = list(f"{new_res_seq:>4}")
                         l[30:38] = list(f"{new_vec[0]:8.3f}")
                         l[38:46] = list(f"{new_vec[1]:8.3f}")
@@ -1523,6 +1664,7 @@ def open_chain_modifier():
             if not self.working_file_path or self.detected_layers <= 1: return
             if not self.working_model_id: return
             
+            self.sync_viewer_to_file()
             try:
                 self.text_area.append(f"\n>>> Re-evaluating secondary structure using ChimeraX dssp...")
                 run(self.session, f"dssp #{self.working_model_id}")
