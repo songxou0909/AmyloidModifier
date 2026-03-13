@@ -142,14 +142,40 @@ def open_chain_modifier():
                 QMessageBox.critical(self, "Error", str(e))
 
         def write_cif(self, path, mapping):
+            import shlex
             data = self.full_cif_data
             cm = data['col_map']
             idx_auth = cm.get('auth_asym_id')
             idx_label = cm.get('label_asym_id')
             target_idx = idx_auth if idx_auth is not None else idx_label
             if target_idx is None: raise ValueError("No chain ID columns found.")
+            
             with open(path, 'w') as f:
-                f.writelines(data['pre_loop'])
+                in_loop = False; loop_headers = []; chain_cols = []
+                for line in data['pre_loop']:
+                    s = line.strip()
+                    if s == "loop_":
+                        in_loop = True; loop_headers = []; chain_cols = []; f.write(line); continue
+                    if in_loop and s.startswith("_"):
+                        loop_headers.append(s)
+                        if "asym_id" in s: chain_cols.append(len(loop_headers) - 1)
+                        f.write(line); continue
+                    if in_loop and s and not s.startswith("#") and not s.startswith("_") and chain_cols:
+                        try: parts = shlex.split(s)
+                        except: parts = s.split()
+                        if len(parts) >= len(loop_headers):
+                            mapped_any = False
+                            for c_idx in chain_cols:
+                                if c_idx < len(parts) and parts[c_idx] in mapping:
+                                    parts[c_idx] = mapping[parts[c_idx]]
+                                    mapped_any = True
+                            if mapped_any:
+                                new_line = " ".join([f"'{p}'" if ' ' in p else p for p in parts]) + "\n"
+                                f.write(new_line)
+                                continue
+                    if s.startswith("#"): in_loop = False
+                    f.write(line)
+                    
                 f.writelines(data['loop_headers'])
                 for old_id, lines in data['chain_lines'].items():
                     if old_id in mapping:
@@ -662,7 +688,7 @@ def open_chain_modifier():
 
             except Exception as e: self.txt.append(str(e))
 
-    # ====================== Multi-layer Chain Modifier Class (PDB) ======================
+    # ====================== Multi-layer Chain Modifier Class ======================
     class PDBLayerIdentifier(QWidget):
         
         CHAIN_RECORD_SPECS = {
@@ -770,18 +796,21 @@ def open_chain_modifier():
             hb_ren.addWidget(QLabel("(Rename Chain ID from the Middle Out)"))
             v_ops.addLayout(hb_ren)
 
+            self.chk_numbers_first = QCheckBox("Use Numbers (0-9) after Z")
+            self.chk_numbers_first.setToolTip("Use only one letter/number to rename chains to avoid problems loading PDB in old softwares")
+            v_ops.addWidget(self.chk_numbers_first)
+
+            self.chk_only_numbers = QCheckBox("Use only numbers")
+            self.chk_only_numbers.setToolTip("Use only numbers to rename chains")
+            v_ops.addWidget(self.chk_only_numbers)
+            self.chk_numbers_first.toggled.connect(lambda state: state and self.chk_only_numbers.setChecked(False))
+            self.chk_only_numbers.toggled.connect(lambda state: state and self.chk_numbers_first.setChecked(False))
+
             self.btn_beta = QPushButton("Re-evaluate β-sheet structure")
             self.btn_beta.clicked.connect(self.action_evaluate_beta)
             self.btn_beta.setEnabled(False) 
             v_ops.addWidget(self.btn_beta)
             
-            self.chk_numbers_first = QCheckBox("Use Numbers (0-9) after Z")
-            v_ops.addWidget(self.chk_numbers_first)
-
-            self.chk_only_numbers = QCheckBox("Use only numbers")
-            v_ops.addWidget(self.chk_only_numbers)
-            self.chk_numbers_first.toggled.connect(lambda state: state and self.chk_only_numbers.setChecked(False))
-            self.chk_only_numbers.toggled.connect(lambda state: state and self.chk_numbers_first.setChecked(False))
 
             hb_res = QHBoxLayout()
             self.btn_restrain = QPushButton("Generate Restrain File")
@@ -811,7 +840,7 @@ def open_chain_modifier():
             params_layout.addRow("Z Shift Min (Å):", self.edit_z_min)
             self.edit_z_max = create_param_input(5.0, "Maximum vertical distance to be considered as a layer stack")
             params_layout.addRow("Z Shift Max (Å):", self.edit_z_max)
-            self.edit_xy_limit = create_param_input(3.0, "Maximum horizontal drift allowed between stacked subunits")
+            self.edit_xy_limit = create_param_input(3.0, "Maximum horizontal drift allowed between stacked subunits, increase this number if your amino acids extend too long from fibril axis")
             params_layout.addRow("XY Shift Limit (Å):", self.edit_xy_limit)
             self.edit_neighbor_count = create_param_input(6, "How many closest chains to search for stacking each time", is_int=True)
             params_layout.addRow("Neighbor Search Count:", self.edit_neighbor_count)
@@ -866,7 +895,8 @@ def open_chain_modifier():
             if self.working_model_id and self.working_file_path:
                 from chimerax.core.commands import run
                 try:
-                    run(self.session, f'save "{self.working_file_path}" models #{self.working_model_id} format pdb')
+                    save_format = "mmcif" if self.working_file_path.lower().endswith('.cif') else "pdb"
+                    run(self.session, f'save "{self.working_file_path}" models #{self.working_model_id} format {save_format}')
                 except Exception:
                     pass
 
@@ -901,23 +931,54 @@ def open_chain_modifier():
 
             het_atoms = []
             molecule_map = {}
+            is_cif = self.working_file_path.lower().endswith('.cif')
+            
             with open(self.working_file_path, 'r') as f:
+                headers = []
+                in_atom_site = False
                 for i, line in enumerate(f):
-                    if line.startswith("HETATM") or line.startswith("ATOM"):
-                        res_name = line[17:20].strip()
-                        chain_id = line[20:22].strip()
-                        res_seq = line[22:26].strip()
-                        if chain_id in self.results: continue 
-                        try:
-                            x, y, z = float(line[30:38]), float(line[38:46]), float(line[46:54])
-                            atom_data = {'idx': i, 'x': x, 'y': y, 'z': z, 'res': res_name, 'chain': chain_id, 'res_seq': res_seq}
-                            het_atoms.append(atom_data)
-                            
-                            mol_key = (chain_id, res_seq)
-                            if mol_key not in molecule_map:
-                                molecule_map[mol_key] = []
-                            molecule_map[mol_key].append(i)
-                        except: continue
+                    s = line.strip()
+                    if is_cif:
+                        if s == "loop_": continue
+                        if s.startswith("_atom_site."):
+                            in_atom_site = True
+                            headers.append(s.split('.')[1])
+                            continue
+                        if in_atom_site and s and not s.startswith("_") and not s.startswith("#"):
+                            parts = s.split()
+                            if len(parts) >= len(headers):
+                                group = parts[headers.index("group_PDB")]
+                                if group in ["HETATM", "ATOM"]:
+                                    res_name = parts[headers.index("label_comp_id")]
+                                    col_c = headers.index("auth_asym_id") if "auth_asym_id" in headers else headers.index("label_asym_id")
+                                    chain_id = parts[col_c]
+                                    col_seq = headers.index("auth_seq_id") if "auth_seq_id" in headers else headers.index("label_seq_id")
+                                    res_seq = parts[col_seq]
+                                    if chain_id in self.results: continue
+                                    try:
+                                        x, y, z = float(parts[headers.index("Cartn_x")]), float(parts[headers.index("Cartn_y")]), float(parts[headers.index("Cartn_z")])
+                                        atom_data = {'idx': i, 'x': x, 'y': y, 'z': z, 'res': res_name, 'chain': chain_id, 'res_seq': res_seq}
+                                        het_atoms.append(atom_data)
+                                        mol_key = (chain_id, res_seq)
+                                        if mol_key not in molecule_map: molecule_map[mol_key] = []
+                                        molecule_map[mol_key].append(i)
+                                    except: pass
+                        elif s.startswith("#"): in_atom_site = False
+                    else:
+                        if line.startswith("HETATM") or line.startswith("ATOM"):
+                            res_name = line[17:20].strip()
+                            chain_id = line[20:22].strip()
+                            res_seq = line[22:26].strip()
+                            if chain_id in self.results: continue 
+                            try:
+                                x, y, z = float(line[30:38]), float(line[38:46]), float(line[46:54])
+                                atom_data = {'idx': i, 'x': x, 'y': y, 'z': z, 'res': res_name, 'chain': chain_id, 'res_seq': res_seq}
+                                het_atoms.append(atom_data)
+                                
+                                mol_key = (chain_id, res_seq)
+                                if mol_key not in molecule_map: molecule_map[mol_key] = []
+                                molecule_map[mol_key].append(i)
+                            except: continue
 
             water_columns = [] 
             processed_indices = set()
@@ -949,8 +1010,7 @@ def open_chain_modifier():
                             best_atom = atom
                     if best_atom and min_dist <= water_z_limit: 
                         mol_key = (best_atom['chain'], best_atom['res_seq'])
-                        for mol_idx in molecule_map[mol_key]:
-                            kept_line_indices.add(mol_idx)
+                        for mol_idx in molecule_map[mol_key]: kept_line_indices.add(mol_idx)
 
             return kept_line_indices
 
@@ -1021,10 +1081,14 @@ def open_chain_modifier():
                 folder = os.path.join(os.path.expanduser("~"), ".chimerax_modifier_temp")
                 os.makedirs(folder, exist_ok=True)
                 
-                name_part, _ = os.path.splitext(self.original_filename_display)
-                temp_path = os.path.join(folder, f"{name_part}_modified.pdb")
+                name_part, ext = os.path.splitext(self.original_filename_display)
+                is_cif = ext.lower() == '.cif'
+                save_ext = ".cif" if is_cif else ".pdb"
+                save_format = "mmcif" if is_cif else "pdb"
                 
-                run(self.session, f'save "{temp_path}" models #{model.id_string} format pdb')
+                temp_path = os.path.join(folder, f"{name_part}_modified{save_ext}")
+                
+                run(self.session, f'save "{temp_path}" models #{model.id_string} format {save_format}')
                 self.created_temp_files.append(temp_path)
                 self.working_file_path = temp_path
                 self.grp_ops.setEnabled(True)
@@ -1086,7 +1150,10 @@ def open_chain_modifier():
                 mapping = self.create_renaming_mapping(old_sandwiches)
                 
                 new_temp = self.working_file_path + ".tmp"
-                self.write_renamed_pdb(self.working_file_path, new_temp, self.final_sandwiches)
+                if self.working_file_path.lower().endswith('.cif'):
+                    self.write_renamed_cif(self.working_file_path, new_temp, self.final_sandwiches)
+                else:
+                    self.write_renamed_pdb(self.working_file_path, new_temp, self.final_sandwiches)
                 shutil.move(new_temp, self.working_file_path)
                 
                 self.text_area.append("\n>>>> Applied Renaming")
@@ -1180,7 +1247,10 @@ def open_chain_modifier():
                     water_z_limit = self.get_param(self.edit_water_z, 4.0)
                     keep_het_lines = self.get_kept_heteroatoms(valid_layer_indices, xy_lim, water_z_limit)
                     
-                    self.write_trimmed_pdb(self.working_file_path, new_temp, keep_chains, keep_het_lines)
+                    if self.working_file_path.lower().endswith('.cif'):
+                        self.write_trimmed_cif(self.working_file_path, new_temp, keep_chains, keep_het_lines)
+                    else:
+                        self.write_trimmed_pdb(self.working_file_path, new_temp, keep_chains, keep_het_lines)
                     shutil.move(new_temp, self.working_file_path)
                     self.text_area.append(f"\n>>>> Applied Trimming (Kept middle {target_layers} layers + associated waters)")
                 
@@ -1189,6 +1259,20 @@ def open_chain_modifier():
                     if is_anti:
                         QMessageBox.warning(self, "Action Restricted", "Expansion is currently not supported in Anti-parallel mode. You can only trim layers.")
                         return
+
+                    if not self.working_file_path.lower().endswith('.cif'):
+                        current_atoms = getattr(self, '_last_live_atom_count', 0)
+                        if current_atoms > 0 and total_layers > 0:
+                            estimated_atoms = (current_atoms / total_layers) * target_layers
+                            estimated_chains = (len(self.results) / total_layers) * target_layers
+                            
+                            if estimated_atoms > 99999 or estimated_chains > 700:
+                                QMessageBox.warning(
+                                    self, 
+                                    "PDB Limit Exceeded", 
+                                    "The expanded model will exceed the maximum number of atoms (99,999) or chain IDs (2 letters) a PDB file can hold. Please convert the current model to CIF format and proceed."
+                                )
+                                return
 
                     dialog = self.ExpandDialog(total_layers, self)
                     if dialog.exec() != QDialog.DialogCode.Accepted:
@@ -1209,7 +1293,10 @@ def open_chain_modifier():
                     self.text_area.append("Calculating expansion transformations...")
                     layers_to_add = target_layers - total_layers
                     water_z_limit = self.get_param(self.edit_water_z, 4.0)
-                    applied_twist, applied_rise = self.write_expanded_pdb(self.working_file_path, new_temp, layers_to_add, use_auto, manual_twist, manual_rise, water_z_limit, use_alt)
+                    if self.working_file_path.lower().endswith('.cif'):
+                        applied_twist, applied_rise = self.write_expanded_cif(self.working_file_path, new_temp, layers_to_add, use_auto, manual_twist, manual_rise, water_z_limit, use_alt)
+                    else:
+                        applied_twist, applied_rise = self.write_expanded_pdb(self.working_file_path, new_temp, layers_to_add, use_auto, manual_twist, manual_rise, water_z_limit, use_alt)
                     shutil.move(new_temp, self.working_file_path)
                     self.text_area.append(f"\n>>>> Applied Expansion (Added {layers_to_add} layers, Alternating: {use_alt})")
 
@@ -1384,49 +1471,83 @@ def open_chain_modifier():
             reported_rise = manual_rise
             first_auto_calc = False
 
+            bottom_chains = [s[0] for s in self.final_sandwiches if len(s) > 0]
+            top_chains = [s[-1] for s in self.final_sandwiches if len(s) > 0]
+            
+            com_bottom = np.mean([chain_centroids[c] for c in bottom_chains if c in chain_centroids], axis=0)
+            com_top = np.mean([chain_centroids[c] for c in top_chains if c in chain_centroids], axis=0)
+            
+            axis_vec = com_top - com_bottom
+            axis_len = np.linalg.norm(axis_vec)
+            axis_u = axis_vec / axis_len if axis_len > 0 else np.array([0.0, 0.0, 1.0])
+                
+            z_axis = np.array([0.0, 0.0, 1.0])
+            v = np.cross(axis_u, z_axis)
+            c = np.dot(axis_u, z_axis)
+            if c < -0.999999:
+                R_align = -np.eye(3); R_align[2,2] = 1.0
+            else:
+                vx = np.array([[0, -v[2], v[1]], [v[2], 0, -v[0]], [-v[1], v[0], 0]])
+                R_align = np.eye(3) + vx + (vx @ vx) * (1.0 / (1.0 + c))
+            R_align_inv = R_align.T
+
             for sandwich in self.final_sandwiches:
                 if len(sandwich) == 0: continue
                 
                 bottom_chain = sandwich[0]
                 top_chain = sandwich[-1]
                 
-                if use_alt:
-                    # Alternating expansion (A-B-A-B). Uses a 2-layer step transform.
-                    if use_auto:
-                        if len(sandwich) >= 3:
-                            # Calculate a 2-layer step directly
-                            R_top, t_top = self.get_transform(chain_ca_coords[sandwich[-3]], chain_ca_coords[top_chain])
-                            R_bottom, t_bottom = self.get_transform(chain_ca_coords[sandwich[2]], chain_ca_coords[bottom_chain])
-                        elif len(sandwich) == 2:
-                            # Square the 1-layer transform to approximate a 2-layer step if only 2 layers exist
-                            R_t1, t_t1 = self.get_transform(chain_ca_coords[sandwich[-2]], chain_ca_coords[top_chain])
-                            R_top = R_t1 @ R_t1
-                            t_top = R_t1 @ t_t1 + t_t1
-                            R_b1, t_b1 = self.get_transform(chain_ca_coords[sandwich[1]], chain_ca_coords[bottom_chain])
-                            R_bottom = R_b1 @ R_b1
-                            t_bottom = R_b1 @ t_b1 + t_b1
-                        else:
-                            R_top, t_top = np.eye(3), np.zeros(3)
-                            R_bottom, t_bottom = np.eye(3), np.zeros(3)
-                    else:
-                        rad = math.radians(manual_twist * 2.0)
-                        cos_t, sin_t = math.cos(rad), math.sin(rad)
-                        rise = manual_rise * 2.0
-                        R_top = np.array([[cos_t, -sin_t, 0], [sin_t, cos_t, 0], [0, 0, 1]])
-                        base_t_top = np.array([0.0, 0.0, rise])
-                        t_top = global_centroid - R_top @ global_centroid + base_t_top
-                        
-                        R_bottom = np.array([[cos_t, sin_t, 0], [-sin_t, cos_t, 0], [0, 0, 1]])
-                        base_t_bottom = np.array([0.0, 0.0, -rise])
-                        t_bottom = global_centroid - R_bottom @ global_centroid + base_t_bottom
+                if use_auto:
+                    twists = []
+                    rises = []
+                    step = 2 if use_alt else 1
+                    for i in range(len(sandwich) - step):
+                        coords_1 = (np.array(chain_ca_coords[sandwich[i]]) - global_centroid) @ R_align.T
+                        coords_2 = (np.array(chain_ca_coords[sandwich[i+step]]) - global_centroid) @ R_align.T
+                        R_step, t_step = self.get_transform(coords_1, coords_2)
+                        twists.append(math.degrees(math.atan2(R_step[1, 0], R_step[0, 0])))
+                        rises.append(t_step[2])
                     
-                    if use_auto and not first_auto_calc:
-                        t_ang = math.degrees(math.atan2(R_top[1, 0], R_top[0, 0]))
-                        b_t = t_top - global_centroid + R_top @ global_centroid
-                        reported_twist = t_ang / 2.0
-                        reported_rise = b_t[2] / 2.0
-                        first_auto_calc = True
+                    if not twists and len(sandwich) == 2 and use_alt:
+                        coords_1 = (np.array(chain_ca_coords[sandwich[0]]) - global_centroid) @ R_align.T
+                        coords_2 = (np.array(chain_ca_coords[sandwich[1]]) - global_centroid) @ R_align.T
+                        R_step, t_step = self.get_transform(coords_1, coords_2)
+                        twists.append(math.degrees(math.atan2(R_step[1, 0], R_step[0, 0])) * 2.0)
+                        rises.append(t_step[2] * 2.0)
 
+                    if twists:
+                        avg_twist = sum(twists) / len(twists)
+                        avg_rise = sum(rises) / len(rises)
+                    else:
+                        avg_twist, avg_rise = 0.0, 0.0
+
+                    calc_twist = avg_twist
+                    calc_rise = avg_rise
+                    
+                    if not first_auto_calc:
+                        reported_twist = avg_twist / 2.0 if use_alt else avg_twist
+                        reported_rise = avg_rise / 2.0 if use_alt else avg_rise
+                        first_auto_calc = True
+                else:
+                    calc_twist = manual_twist * 2.0 if use_alt else manual_twist
+                    calc_rise = manual_rise * 2.0 if use_alt else manual_rise
+
+                rad = math.radians(calc_twist)
+                cos_t, sin_t = math.cos(rad), math.sin(rad)
+                
+                R_top_local = np.array([[cos_t, -sin_t, 0], [sin_t, cos_t, 0], [0, 0, 1]])
+                t_top_local = np.array([0.0, 0.0, calc_rise])
+                
+                R_bottom_local = np.array([[cos_t, sin_t, 0], [-sin_t, cos_t, 0], [0, 0, 1]])
+                t_bottom_local = np.array([0.0, 0.0, -calc_rise])
+
+                R_top = R_align_inv @ R_top_local @ R_align
+                t_top = global_centroid - R_top @ global_centroid + (R_align_inv @ t_top_local)
+
+                R_bottom = R_align_inv @ R_bottom_local @ R_align
+                t_bottom = global_centroid - R_bottom @ global_centroid + (R_align_inv @ t_bottom_local)
+
+                if use_alt:
                     if len(sandwich) >= 2:
                         prev_b1 = sandwich[1]
                         prev_b2 = sandwich[0]
@@ -1452,30 +1573,6 @@ def open_chain_modifier():
                         prev_t2 = new_chain_id
 
                 else:
-                    if use_auto and len(sandwich) >= 2:
-                        bottom_next = sandwich[1]
-                        R_bottom, t_bottom = self.get_transform(chain_ca_coords[bottom_next], chain_ca_coords[bottom_chain])
-                        top_prev = sandwich[-2]
-                        R_top, t_top = self.get_transform(chain_ca_coords[top_prev], chain_ca_coords[top_chain])
-                    else:
-                        rad = math.radians(manual_twist)
-                        cos_t = math.cos(rad)
-                        sin_t = math.sin(rad)
-                        R_top = np.array([[cos_t, -sin_t, 0], [sin_t, cos_t, 0], [0, 0, 1]])
-                        base_t_top = np.array([0.0, 0.0, manual_rise])
-                        t_top = global_centroid - R_top @ global_centroid + base_t_top
-                        
-                        R_bottom = np.array([[cos_t, sin_t, 0], [-sin_t, cos_t, 0], [0, 0, 1]])
-                        base_t_bottom = np.array([0.0, 0.0, -manual_rise])
-                        t_bottom = global_centroid - R_bottom @ global_centroid + base_t_bottom
-                    
-                    if use_auto and not first_auto_calc:
-                        t_ang = math.degrees(math.atan2(R_top[1, 0], R_top[0, 0]))
-                        b_t = t_top - global_centroid + R_top @ global_centroid
-                        reported_twist = t_ang
-                        reported_rise = b_t[2]
-                        first_auto_calc = True
-
                     current_ref_chain = bottom_chain
                     for _ in range(bottom_layers_to_add):
                         new_chain_id = get_new_chain_id()
@@ -1561,8 +1658,37 @@ def open_chain_modifier():
             serial_counter = 1
             serial_map = {}
 
+            chain_exp_map = {}
+            for ref_c, new_c, _, _ in expansions:
+                if ref_c not in chain_exp_map: chain_exp_map[ref_c] = []
+                chain_exp_map[ref_c].append(new_c)
+
+            new_headers = []
+            for line in headers:
+                new_headers.append(line)
+                record = line[0:6].strip()
+                if record in self.CHAIN_RECORD_SPECS:
+                    slice_list = self.CHAIN_RECORD_SPECS[record]
+                    chains_in_line = []
+                    for start, end in slice_list:
+                        if end <= len(line):
+                            c = line[start:end].strip()
+                            if c: chains_in_line.append((start, end, c))
+                    
+                    if chains_in_line and all(c_info[2] in chain_exp_map for c_info in chains_in_line):
+                        num_expansions = len(chain_exp_map[chains_in_line[0][2]])
+                        if all(len(chain_exp_map[c_info[2]]) == num_expansions for c_info in chains_in_line):
+                            for i in range(num_expansions):
+                                line_chars = list(line)
+                                for start, end, old_c in chains_in_line:
+                                    new_c = chain_exp_map[old_c][i]
+                                    width = end - start
+                                    formatted = f"{new_c:>{width}}"[:width]
+                                    line_chars[start:end] = list(formatted)
+                                new_headers.append("".join(line_chars))
+
             with open(output_path, 'w') as fout:
-                for line in headers:
+                for line in new_headers:
                     fout.write(line)
                     
                 for line in orig_atoms_ters:
@@ -1669,7 +1795,8 @@ def open_chain_modifier():
                 self.text_area.append(f"\n>>> Re-evaluating secondary structure using ChimeraX dssp...")
                 run(self.session, f"dssp #{self.working_model_id}")
                 
-                run(self.session, f'save "{self.working_file_path}" models #{self.working_model_id} format pdb')
+                save_format = "mmcif" if self.working_file_path.lower().endswith('.cif') else "pdb"
+                run(self.session, f'save "{self.working_file_path}" models #{self.working_model_id} format {save_format}')
                 self.reload_working_model()
                 self.process_pdb(self.working_file_path)
                 self.text_area.append(f">>> β-sheet evaluation completed \n>>> Reloaded PDB file")
@@ -1678,6 +1805,8 @@ def open_chain_modifier():
                 self.text_area.append(f"ChimeraX DSSP Error: {e}")
 
         def check_spatial_and_id_duplicates(self, file_path):
+            if file_path.lower().endswith('.cif'):
+                return
             split_line_indices = set()
             segments_per_chain_id = {} 
             last_chain_id = None
@@ -1751,7 +1880,10 @@ def open_chain_modifier():
             NEIGHBOR_SEARCH_COUNT = int(self.get_param(self.edit_neighbor_count, 6))
             
             try:
-                raw_chains, waters, ions = self.parse_pdb_manual_logic(filename)
+                if filename.lower().endswith('.cif'):
+                    raw_chains, waters, ions = self.parse_cif_manual_logic(filename)
+                else:
+                    raw_chains, waters, ions = self.parse_pdb_manual_logic(filename)
                 if not raw_chains:
                     self.text_area.append("Error: No Alpha Carbons found.")
                     return
@@ -2062,6 +2194,59 @@ def open_chain_modifier():
             except Exception as e:
                 self.text_area.append(f"Analysis Error: {str(e)}")
 
+        def parse_cif_manual_logic(self, filepath):
+            import numpy as np
+            chains = {}; waters = []; ions = []
+            headers = []; in_loop = False; start_idx = -1
+            
+            with open(filepath, 'r') as f:
+                lines = f.readlines()
+                
+            for i, line in enumerate(lines):
+                s = line.strip()
+                if s == "loop_":
+                    in_loop = True; headers = []
+                elif s.startswith("_atom_site."):
+                    headers.append(s.split('.')[1])
+                elif in_loop and s.startswith("_"): pass
+                elif in_loop and headers and "group_PDB" in headers:
+                    start_idx = i; break
+                else: in_loop = False
+                    
+            if start_idx == -1: return chains, waters, ions
+            
+            try:
+                i_group = headers.index("group_PDB")
+                i_atom = headers.index("label_atom_id")
+                i_res = headers.index("label_comp_id")
+                i_chain = headers.index("auth_asym_id") if "auth_asym_id" in headers else headers.index("label_asym_id")
+                i_seq = headers.index("auth_seq_id") if "auth_seq_id" in headers else headers.index("label_seq_id")
+                i_x = headers.index("Cartn_x")
+                i_y = headers.index("Cartn_y")
+                i_z = headers.index("Cartn_z")
+            except ValueError: return chains, waters, ions
+                
+            for line in lines[start_idx:]:
+                if line.strip() == "#" or line.startswith("loop_"): break
+                parts = line.split()
+                if len(parts) < len(headers): continue
+                
+                group, atom_name, res_name = parts[i_group], parts[i_atom], parts[i_res]
+                chain_id, res_id = parts[i_chain], parts[i_seq]
+                
+                try: x, y, z = float(parts[i_x]), float(parts[i_y]), float(parts[i_z])
+                except ValueError: continue
+                    
+                if group == "ATOM" and ("CA" == atom_name or "CA" in atom_name):
+                    if chain_id not in chains: chains[chain_id] = []
+                    chains[chain_id].append({'id': res_id, 'coord': np.array([x, y, z])})
+                elif group == "HETATM":
+                    if res_name in ["HOH", "WAT"]:
+                        if atom_name.startswith("O"): waters.append((x, y, z))
+                    else: ions.append((x, y, z))
+                    
+            return chains, waters, ions
+
         def parse_pdb_manual_logic(self, filepath):
             chains = {}; waters = []; ions = []
             with open(filepath, 'r') as f:
@@ -2168,6 +2353,492 @@ def open_chain_modifier():
                                 break
                         mapping[chain_id] = new_label
             return mapping
+        
+        def write_renamed_cif(self, input_filename, output_filename, sandwiches):
+            prot_mapping = self.create_renaming_mapping(sandwiches)
+            with open(input_filename, 'r') as fin, open(output_filename, 'w') as fout:
+                headers = []
+                in_atom_site = False
+                col_c = col_l = -1
+                for line in fin:
+                    s = line.strip()
+                    if s == "loop_": fout.write(line); continue
+                    if s.startswith("_atom_site."):
+                        in_atom_site = True
+                        headers.append(s.split('.')[1])
+                        fout.write(line); continue
+                    
+                    if in_atom_site and s and not s.startswith("_") and not s.startswith("#"):
+                        if col_c == -1:
+                            col_c = headers.index("auth_asym_id") if "auth_asym_id" in headers else -1
+                            col_l = headers.index("label_asym_id") if "label_asym_id" in headers else -1
+                        parts = line.split()
+                        if len(parts) >= len(headers):
+                            target_col = col_c if col_c != -1 else col_l
+                            if target_col != -1:
+                                old_chain = parts[target_col]
+                                if old_chain in prot_mapping:
+                                    if col_c != -1: parts[col_c] = prot_mapping[old_chain]
+                                    if col_l != -1: parts[col_l] = prot_mapping[old_chain]
+                                    fout.write(" ".join(parts) + "\n")
+                                    continue
+                    elif s.startswith("#"): in_atom_site = False
+                    fout.write(line)
+
+        def write_trimmed_cif(self, input_path, output_path, keep_chains, keep_het_lines):
+            import shlex
+            with open(input_path, 'r') as fin, open(output_path, 'w') as fout:
+                in_loop = False
+                loop_headers = []
+                chain_cols = []
+                is_atom_site = False
+                
+                for i, line in enumerate(fin):
+                    s = line.strip()
+                    if s == "loop_":
+                        in_loop = True; loop_headers = []; chain_cols = []; is_atom_site = False
+                        fout.write(line)
+                        continue
+                        
+                    if in_loop and s.startswith("_"):
+                        loop_headers.append(s)
+                        if "asym_id" in s: chain_cols.append(len(loop_headers) - 1)
+                        if "_atom_site." in s: is_atom_site = True
+                        fout.write(line)
+                        continue
+                        
+                    if in_loop and s and not s.startswith("#") and not s.startswith("_"):
+                        if is_atom_site:
+                            parts = s.split()
+                            if len(parts) >= len(loop_headers):
+                                target_col = -1
+                                for idx, h in enumerate(loop_headers):
+                                    if "auth_asym_id" in h: target_col = idx; break
+                                    elif "label_asym_id" in h: target_col = idx
+                                if target_col != -1 and target_col < len(parts):
+                                    if parts[target_col] in keep_chains or i in keep_het_lines:
+                                        fout.write(line)
+                            continue
+                        elif chain_cols:
+                            try: parts = shlex.split(s)
+                            except: parts = s.split()
+                            if len(parts) >= len(loop_headers):
+                                keep_line = True
+                                for c_idx in chain_cols:
+                                    if c_idx < len(parts):
+                                        c_val = parts[c_idx]
+                                        if c_val not in ["?", "."] and c_val not in keep_chains:
+                                            keep_line = False; break
+                                if keep_line: fout.write(line)
+                            continue
+                        else:
+                            fout.write(line)
+                            continue
+                            
+                    if s.startswith("#"): in_loop = False
+                    fout.write(line)
+
+        def write_expanded_cif(self, input_path, output_path, layers_to_add, use_auto, manual_twist, manual_rise, water_z_limit=4.0, use_alt=False):
+            import numpy as np
+            import math
+            top_layers_to_add = layers_to_add // 2
+            bottom_layers_to_add = layers_to_add - top_layers_to_add
+
+            used_chain_ids = set()
+            headers = []
+            pre_lines, post_lines, atom_lines = [], [], []
+            in_atom_site = False
+
+            with open(input_path, 'r') as fin:
+                for line in fin:
+                    s = line.strip()
+                    if s == "loop_":
+                        if not in_atom_site and not headers: pre_lines.append(line)
+                        else: post_lines.append(line)
+                        continue
+                    if s.startswith("_atom_site."):
+                        in_atom_site = True
+                        headers.append(s.split('.')[1])
+                        pre_lines.append(line)
+                        continue
+                    if in_atom_site and s and not s.startswith("_") and not s.startswith("#"):
+                        parts = line.split()
+                        if len(parts) >= len(headers):
+                            atom_lines.append(parts)
+                            col_c = headers.index("auth_asym_id") if "auth_asym_id" in headers else headers.index("label_asym_id")
+                            used_chain_ids.add(parts[col_c])
+                        continue
+                    elif s.startswith("#") and in_atom_site:
+                        in_atom_site = False
+                        post_lines.append(line)
+                    else:
+                        if not in_atom_site and not headers: pre_lines.append(line)
+                        else: post_lines.append(line)
+
+            col_x = headers.index("Cartn_x")
+            col_y = headers.index("Cartn_y")
+            col_z = headers.index("Cartn_z")
+            col_c = headers.index("auth_asym_id") if "auth_asym_id" in headers else headers.index("label_asym_id")
+            col_group = headers.index("group_PDB")
+
+            def get_new_chain_id():
+                idx = 0
+                while True:
+                    label = self.generate_label(idx)
+                    if label not in used_chain_ids:
+                        used_chain_ids.add(label)
+                        return label
+                    idx += 1
+
+            core_chains = set()
+            for s in self.final_sandwiches: core_chains.update(s)
+
+            chain_atoms, chain_ca_coords, chain_centroids = {}, {}, {}
+            associated_atoms = {cid: [] for cid in core_chains}
+            
+            for parts in atom_lines:
+                cid, group = parts[col_c], parts[col_group]
+                try: x, y, z = float(parts[col_x]), float(parts[col_y]), float(parts[col_z])
+                except ValueError: continue
+                
+                if group == "ATOM" and cid in core_chains:
+                    if cid not in chain_atoms:
+                        chain_atoms[cid] = []
+                        chain_ca_coords[cid] = []
+                    chain_atoms[cid].append(parts)
+                    if "CA" in parts[headers.index("label_atom_id")]: chain_ca_coords[cid].append([x, y, z])
+
+            for cid, coords in chain_ca_coords.items():
+                if coords: chain_centroids[cid] = np.mean(coords, axis=0)
+
+            core_ca_coords = []
+            for cid in core_chains:
+                if cid in chain_ca_coords: core_ca_coords.extend(chain_ca_coords[cid])
+            global_centroid = np.mean(core_ca_coords, axis=0) if core_ca_coords else np.zeros(3)
+
+            for parts in atom_lines:
+                group = parts[col_group]
+                if group == "HETATM" or (group == "ATOM" and parts[col_c] not in core_chains):
+                    try:
+                        x, y, z = float(parts[col_x]), float(parts[col_y]), float(parts[col_z])
+                        best_chain = None
+                        min_dist = float('inf')
+                        for cid, centroid in chain_centroids.items():
+                            if abs(z - centroid[2]) <= water_z_limit:
+                                dist = math.sqrt((x - centroid[0])**2 + (y - centroid[1])**2 + (z - centroid[2])**2)
+                                if dist < min_dist:
+                                    min_dist, best_chain = dist, cid
+                        if best_chain: associated_atoms[best_chain].append(parts)
+                    except ValueError: pass
+
+            expansions = []
+            reported_twist, reported_rise = manual_twist, manual_rise
+            first_auto_calc = False
+
+            bottom_chains = [s[0] for s in self.final_sandwiches if len(s) > 0]
+            top_chains = [s[-1] for s in self.final_sandwiches if len(s) > 0]
+            
+            com_bottom = np.mean([chain_centroids[c] for c in bottom_chains if c in chain_centroids], axis=0)
+            com_top = np.mean([chain_centroids[c] for c in top_chains if c in chain_centroids], axis=0)
+            
+            axis_vec = com_top - com_bottom
+            axis_len = np.linalg.norm(axis_vec)
+            axis_u = axis_vec / axis_len if axis_len > 0 else np.array([0.0, 0.0, 1.0])
+                
+            z_axis = np.array([0.0, 0.0, 1.0])
+            v = np.cross(axis_u, z_axis)
+            c = np.dot(axis_u, z_axis)
+            if c < -0.999999:
+                R_align = -np.eye(3); R_align[2,2] = 1.0
+            else:
+                vx = np.array([[0, -v[2], v[1]], [v[2], 0, -v[0]], [-v[1], v[0], 0]])
+                R_align = np.eye(3) + vx + (vx @ vx) * (1.0 / (1.0 + c))
+            R_align_inv = R_align.T
+
+            for sandwich in self.final_sandwiches:
+                if len(sandwich) == 0: continue
+                
+                bottom_chain = sandwich[0]
+                top_chain = sandwich[-1]
+                
+                if use_auto:
+                    twists = []
+                    rises = []
+                    step = 2 if use_alt else 1
+                    for i in range(len(sandwich) - step):
+                        coords_1 = (np.array(chain_ca_coords[sandwich[i]]) - global_centroid) @ R_align.T
+                        coords_2 = (np.array(chain_ca_coords[sandwich[i+step]]) - global_centroid) @ R_align.T
+                        R_step, t_step = self.get_transform(coords_1, coords_2)
+                        twists.append(math.degrees(math.atan2(R_step[1, 0], R_step[0, 0])))
+                        rises.append(t_step[2])
+                    
+                    if not twists and len(sandwich) == 2 and use_alt:
+                        coords_1 = (np.array(chain_ca_coords[sandwich[0]]) - global_centroid) @ R_align.T
+                        coords_2 = (np.array(chain_ca_coords[sandwich[1]]) - global_centroid) @ R_align.T
+                        R_step, t_step = self.get_transform(coords_1, coords_2)
+                        twists.append(math.degrees(math.atan2(R_step[1, 0], R_step[0, 0])) * 2.0)
+                        rises.append(t_step[2] * 2.0)
+
+                    if twists:
+                        avg_twist = sum(twists) / len(twists)
+                        avg_rise = sum(rises) / len(rises)
+                    else:
+                        avg_twist, avg_rise = 0.0, 0.0
+
+                    calc_twist = avg_twist
+                    calc_rise = avg_rise
+                    
+                    if not first_auto_calc:
+                        reported_twist = avg_twist / 2.0 if use_alt else avg_twist
+                        reported_rise = avg_rise / 2.0 if use_alt else avg_rise
+                        first_auto_calc = True
+                else:
+                    calc_twist = manual_twist * 2.0 if use_alt else manual_twist
+                    calc_rise = manual_rise * 2.0 if use_alt else manual_rise
+
+                rad = math.radians(calc_twist)
+                cos_t, sin_t = math.cos(rad), math.sin(rad)
+                
+                R_top_local = np.array([[cos_t, -sin_t, 0], [sin_t, cos_t, 0], [0, 0, 1]])
+                t_top_local = np.array([0.0, 0.0, calc_rise])
+                
+                R_bottom_local = np.array([[cos_t, sin_t, 0], [-sin_t, cos_t, 0], [0, 0, 1]])
+                t_bottom_local = np.array([0.0, 0.0, -calc_rise])
+
+                R_top = R_align_inv @ R_top_local @ R_align
+                t_top = global_centroid - R_top @ global_centroid + (R_align_inv @ t_top_local)
+
+                R_bottom = R_align_inv @ R_bottom_local @ R_align
+                t_bottom = global_centroid - R_bottom @ global_centroid + (R_align_inv @ t_bottom_local)
+
+                if use_alt:
+                    if len(sandwich) >= 2:
+                        prev_b1 = sandwich[1]
+                        prev_b2 = sandwich[0]
+                    else:
+                        prev_b1 = prev_b2 = sandwich[0]
+                        
+                    for _ in range(bottom_layers_to_add):
+                        new_chain_id = get_new_chain_id()
+                        expansions.append((prev_b1, new_chain_id, R_bottom, t_bottom))
+                        prev_b1 = prev_b2
+                        prev_b2 = new_chain_id
+
+                    if len(sandwich) >= 2:
+                        prev_t1 = sandwich[-2]
+                        prev_t2 = sandwich[-1]
+                    else:
+                        prev_t1 = prev_t2 = sandwich[-1]
+                        
+                    for _ in range(top_layers_to_add):
+                        new_chain_id = get_new_chain_id()
+                        expansions.append((prev_t1, new_chain_id, R_top, t_top))
+                        prev_t1 = prev_t2
+                        prev_t2 = new_chain_id
+
+                else:
+                    current_ref_chain = bottom_chain
+                    for _ in range(bottom_layers_to_add):
+                        new_chain_id = get_new_chain_id()
+                        expansions.append((current_ref_chain, new_chain_id, R_bottom, t_bottom))
+                        current_ref_chain = new_chain_id
+                        
+                    current_ref_chain = top_chain
+                    for _ in range(top_layers_to_add):
+                        new_chain_id = get_new_chain_id()
+                        expansions.append((current_ref_chain, new_chain_id, R_top, t_top))
+                        current_ref_chain = new_chain_id
+
+            col_res = headers.index("label_comp_id") if "label_comp_id" in headers else headers.index("auth_comp_id")
+            
+            het_types = set()
+            for parts in atom_lines:
+                if parts[col_group] == "HETATM":
+                    het_types.add(parts[col_res])
+
+            reserved_het_chains = {}
+            alphabet_backwards = "ZYXWVUTSRQPONMLKJIHGFEDCBA"
+            for i, htype in enumerate(sorted(list(het_types))):
+                if i < len(alphabet_backwards):
+                    c = alphabet_backwards[i]
+                    reserved_het_chains[htype] = c
+                    used_chain_ids.add(c)
+                else:
+                    idx = 0
+                    while True:
+                        label = self.generate_label(idx)
+                        if label not in used_chain_ids and label not in reserved_het_chains.values():
+                            reserved_het_chains[htype] = label
+                            used_chain_ids.add(label)
+                            break
+                        idx += 1
+
+            col_auth_seq = headers.index("auth_seq_id") if "auth_seq_id" in headers else -1
+            col_label_seq = headers.index("label_seq_id") if "label_seq_id" in headers else -1
+
+            new_atom_lines = []
+            het_seq_counters = {c: 1 for c in reserved_het_chains.values()}
+            max_seq = {} 
+            original_het_map = {}
+            
+            for parts in atom_lines:
+                new_parts = parts[:]
+                orig_c = new_parts[col_c]
+                cid = orig_c
+                
+                if new_parts[col_group] == "HETATM":
+                    res_name = new_parts[col_res]
+                    if res_name in reserved_het_chains:
+                        target_chain = reserved_het_chains[res_name]
+                        new_parts[col_c] = target_chain
+                        if "label_asym_id" in headers and "auth_asym_id" in headers:
+                            new_parts[headers.index("label_asym_id")] = target_chain
+                        
+                        orig_seq = parts[col_auth_seq] if col_auth_seq != -1 else (parts[col_label_seq] if col_label_seq != -1 else "")
+                        mol_key = (orig_c, orig_seq, res_name)
+                        
+                        if mol_key not in original_het_map:
+                            original_het_map[mol_key] = het_seq_counters[target_chain]
+                            het_seq_counters[target_chain] += 1
+                            
+                        new_seq = original_het_map[mol_key]
+                        if col_auth_seq != -1: new_parts[col_auth_seq] = str(new_seq)
+                        if col_label_seq != -1: new_parts[col_label_seq] = str(new_seq)
+                        cid = target_chain 
+                
+                seq = -1
+                if col_auth_seq != -1 and new_parts[col_auth_seq].isdigit(): seq = int(new_parts[col_auth_seq])
+                elif col_label_seq != -1 and new_parts[col_label_seq].isdigit(): seq = int(new_parts[col_label_seq])
+                if seq > max_seq.get(cid, 0): max_seq[cid] = seq
+                
+                new_atom_lines.append(new_parts)
+
+            for ref_chain, new_chain, R, t in expansions:
+                new_chain_parts = []
+                for parts in chain_atoms.get(ref_chain, []):
+                    new_parts = parts[:]
+                    new_vec = R @ np.array([float(new_parts[col_x]), float(new_parts[col_y]), float(new_parts[col_z])]) + t
+                    new_parts[col_c] = new_chain
+                    if "label_asym_id" in headers and "auth_asym_id" in headers: new_parts[headers.index("label_asym_id")] = new_chain
+                    new_parts[col_x], new_parts[col_y], new_parts[col_z] = f"{new_vec[0]:.3f}", f"{new_vec[1]:.3f}", f"{new_vec[2]:.3f}"
+                    
+                    seq = -1
+                    if col_auth_seq != -1 and new_parts[col_auth_seq].isdigit(): seq = int(new_parts[col_auth_seq])
+                    elif col_label_seq != -1 and new_parts[col_label_seq].isdigit(): seq = int(new_parts[col_label_seq])
+                    if seq > max_seq.get(new_chain, 0): max_seq[new_chain] = seq
+                    
+                    new_atom_lines.append(new_parts)
+                    new_chain_parts.append(new_parts)
+                chain_atoms[new_chain] = new_chain_parts
+                    
+                new_het_lines_for_next = []
+                het_res_map = {} 
+                for parts in associated_atoms.get(ref_chain, []):
+                    new_parts = parts[:]
+                    new_vec = R @ np.array([float(new_parts[col_x]), float(new_parts[col_y]), float(new_parts[col_z])]) + t
+                    
+                    res_name = new_parts[col_res]
+                    is_hetatm = new_parts[col_group] == "HETATM"
+                    
+                    if is_hetatm and res_name in reserved_het_chains:
+                        target_chain = reserved_het_chains[res_name]
+                        new_parts[col_c] = target_chain
+                        if "label_asym_id" in headers and "auth_asym_id" in headers: new_parts[headers.index("label_asym_id")] = target_chain
+                        new_parts[col_x], new_parts[col_y], new_parts[col_z] = f"{new_vec[0]:.3f}", f"{new_vec[1]:.3f}", f"{new_vec[2]:.3f}"
+                        
+                        orig_seq_str = parts[col_auth_seq] if col_auth_seq != -1 else (parts[col_label_seq] if col_label_seq != -1 else "")
+                        orig_c_str = parts[col_c]
+                        res_key = (orig_c_str, orig_seq_str, res_name)
+                        
+                        if res_key not in het_res_map:
+                            het_res_map[res_key] = het_seq_counters[target_chain]
+                            het_seq_counters[target_chain] += 1
+                            
+                        new_seq_str = str(het_res_map[res_key])
+                        if col_auth_seq != -1: new_parts[col_auth_seq] = new_seq_str
+                        if col_label_seq != -1: new_parts[col_label_seq] = new_seq_str
+                    else:
+                        target_chain = new_chain
+                        new_parts[col_c] = target_chain
+                        if "label_asym_id" in headers and "auth_asym_id" in headers: new_parts[headers.index("label_asym_id")] = target_chain
+                        new_parts[col_x], new_parts[col_y], new_parts[col_z] = f"{new_vec[0]:.3f}", f"{new_vec[1]:.3f}", f"{new_vec[2]:.3f}"
+                        
+                        orig_seq_str = parts[col_auth_seq] if col_auth_seq != -1 else (parts[col_label_seq] if col_label_seq != -1 else "")
+                        orig_c_str = parts[col_c]
+                        res_key = (orig_c_str, orig_seq_str, res_name)
+                        
+                        if res_key not in het_res_map:
+                            max_seq[target_chain] = max_seq.get(target_chain, 0) + 1
+                            het_res_map[res_key] = max_seq[target_chain]
+                            
+                        new_seq_str = str(het_res_map[res_key])
+                        if col_auth_seq != -1: new_parts[col_auth_seq] = new_seq_str
+                        if col_label_seq != -1: new_parts[col_label_seq] = new_seq_str
+
+                    new_atom_lines.append(new_parts)
+                    new_het_lines_for_next.append(new_parts)
+                associated_atoms[new_chain] = new_het_lines_for_next
+
+            col_id = headers.index("id") if "id" in headers else -1
+            if col_id != -1:
+                for i, parts in enumerate(new_atom_lines): parts[col_id] = str(i + 1)
+
+            import shlex
+            chain_exp_map = {}
+            for ref_c, new_c, _, _ in expansions:
+                if ref_c not in chain_exp_map: chain_exp_map[ref_c] = []
+                chain_exp_map[ref_c].append(new_c)
+
+            def expand_cif_blocks(lines_list):
+                expanded_list = []
+                in_loop = False; loop_headers = []; chain_cols = []
+                
+                for line in lines_list:
+                    s = line.strip()
+                    if s == "loop_":
+                        in_loop = True; loop_headers = []; chain_cols = []; expanded_list.append(line); continue
+                    if in_loop and s.startswith("_"):
+                        loop_headers.append(s)
+                        if "asym_id" in s: chain_cols.append(len(loop_headers) - 1)
+                        expanded_list.append(line); continue
+                    if in_loop and s and not s.startswith("#") and not s.startswith("_") and chain_cols:
+                        try: parts = shlex.split(s)
+                        except: parts = s.split()
+                        expanded_list.append(line)
+                        if len(parts) >= len(loop_headers):
+                            row_chains = []
+                            for c_idx in chain_cols:
+                                if c_idx < len(parts):
+                                    val = parts[c_idx]
+                                    if val not in ["?", "."]:
+                                        row_chains.append(val)
+                            
+                            if row_chains and all(c in chain_exp_map for c in row_chains):
+                                num_expansions = len(chain_exp_map[row_chains[0]])
+                                if all(len(chain_exp_map[c]) == num_expansions for c in row_chains):
+                                    for i in range(num_expansions):
+                                        new_parts = parts[:]
+                                        for c_idx in chain_cols:
+                                            if c_idx < len(new_parts):
+                                                old_c = new_parts[c_idx]
+                                                if old_c in chain_exp_map:
+                                                    new_parts[c_idx] = chain_exp_map[old_c][i]
+                                        new_line = " ".join([f"'{p}'" if ' ' in p else p for p in new_parts]) + "\n"
+                                        expanded_list.append(new_line)
+                        continue
+                    if s.startswith("#"): in_loop = False
+                    expanded_list.append(line)
+                return expanded_list
+
+            pre_lines = expand_cif_blocks(pre_lines)
+            post_lines = expand_cif_blocks(post_lines)
+
+            with open(output_path, 'w') as fout:
+                for line in pre_lines: fout.write(line)
+                for parts in new_atom_lines: fout.write(" ".join(parts) + "\n")
+                for line in post_lines: fout.write(line)
+
+            return reported_twist, reported_rise
 
         def write_renamed_pdb(self, input_filename, output_filename, sandwiches):
             prot_mapping = self.create_renaming_mapping(sandwiches)
@@ -2396,8 +3067,8 @@ def open_chain_modifier():
             super().__init__()
             self.pdb_widget = PDBLayerIdentifier(tool_instance, session)
             self.cif_widget = CIFLayerIdentifier(tool_instance, session)
-            self.addTab(self.pdb_widget, "PDB Mode")
-            self.addTab(self.cif_widget, "CIF Mode")
+            self.addTab(self.pdb_widget, "Modifier")
+            self.addTab(self.cif_widget, "Layer Viewer")
 
     return ModifierToolTabs
 
