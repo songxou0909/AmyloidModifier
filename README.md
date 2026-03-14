@@ -34,6 +34,10 @@ Songxian Ou, Ruben Hervas Millan's Lab
 
 linkedin.com/in/songxian-ou-51bbab365
 
+## Tutorial
+<video src="https://www.youtube.com/watch?v=X26wr-cCPcM" controls width="600"></video>
+
+
 ![Image Alt](https://github.com/songxou0909/AmyloidModifier/blob/main/screenshot/1.png?raw=true)
 ![Image Alt](https://github.com/songxou0909/AmyloidModifier/blob/main/screenshot/2.png?raw=true)
 ![Image Alt](https://github.com/songxou0909/AmyloidModifier/blob/main/screenshot/3.png?raw=true)
