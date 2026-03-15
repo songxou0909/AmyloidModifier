@@ -152,14 +152,19 @@ def open_chain_modifier():
             
             with open(path, 'w') as f:
                 in_loop = False; loop_headers = []; chain_cols = []
+                header_buffer = []; wrote_headers = False
+                
                 for line in data['pre_loop']:
                     s = line.strip()
                     if s == "loop_":
-                        in_loop = True; loop_headers = []; chain_cols = []; f.write(line); continue
+                        in_loop = True; loop_headers = []; chain_cols = []
+                        header_buffer = [line]; wrote_headers = False
+                        continue
                     if in_loop and s.startswith("_"):
                         loop_headers.append(s)
                         if "asym_id" in s: chain_cols.append(len(loop_headers) - 1)
-                        f.write(line); continue
+                        header_buffer.append(line)
+                        continue
                     if in_loop and s and not s.startswith("#") and not s.startswith("_") and chain_cols:
                         try: parts = shlex.split(s)
                         except: parts = s.split()
@@ -170,12 +175,27 @@ def open_chain_modifier():
                                     parts[c_idx] = mapping[parts[c_idx]]
                                     mapped_any = True
                             if mapped_any:
+                                if not wrote_headers:
+                                    f.writelines(header_buffer)
+                                    wrote_headers = True
                                 new_line = " ".join([f"'{p}'" if ' ' in p else p for p in parts]) + "\n"
                                 f.write(new_line)
-                                continue
-                    if s.startswith("#"): in_loop = False
-                    f.write(line)
-                    
+                        continue
+                    if in_loop and s and not s.startswith("#") and not s.startswith("_") and not chain_cols:
+                        if not wrote_headers:
+                            f.writelines(header_buffer)
+                            wrote_headers = True
+                        f.write(line)
+                        continue
+                    if s.startswith("#"): 
+                        in_loop = False
+                        if wrote_headers or not header_buffer:
+                            f.write(line)
+                        header_buffer = []
+                        continue
+                    if not in_loop or wrote_headers:
+                        f.write(line)
+                        
                 f.writelines(data['loop_headers'])
                 for old_id, lines in data['chain_lines'].items():
                     if old_id in mapping:
@@ -401,6 +421,7 @@ def open_chain_modifier():
             hb_load = QHBoxLayout()
             self.cmb_models = QComboBox()
             self.cmb_models.wheelEvent = lambda event: event.ignore()
+            self.cmb_models.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
             self.populate_models()
             hb_load.addWidget(self.cmb_models)
             
@@ -504,7 +525,9 @@ def open_chain_modifier():
                 self.cmb_models.blockSignals(True)
                 self.cmb_models.clear()
                 for model in current_models:
-                    self.cmb_models.addItem(f"#{model.id_string} {model.name}", userData=model)
+                    item_text = f"#{model.id_string} {model.name}"
+                    self.cmb_models.addItem(item_text, userData=model)
+                    self.cmb_models.setItemData(self.cmb_models.count() - 1, item_text, Qt.ItemDataRole.ToolTipRole)
                 if current_sel_id:
                     for i in range(self.cmb_models.count()):
                         m = self.cmb_models.itemData(i)
@@ -731,6 +754,7 @@ def open_chain_modifier():
             hb_load = QHBoxLayout()
             self.cmb_models = QComboBox()
             self.cmb_models.wheelEvent = lambda event: event.ignore()
+            self.cmb_models.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
             self.populate_models()
             hb_load.addWidget(self.cmb_models)
             
@@ -742,7 +766,6 @@ def open_chain_modifier():
             self.btn_load_model = QPushButton('Load Model')
             self.btn_load_model.clicked.connect(self.load_from_chimerax)
             hb_load.addWidget(self.btn_load_model)
-            hb_load.addStretch()
 
             self.chk_anti = QCheckBox("Anti")
             self.chk_anti.setToolTip("Check this if loading an anti-parallel amyloid")
@@ -1060,7 +1083,9 @@ def open_chain_modifier():
                 self.cmb_models.clear()
                 
                 for model in current_models:
-                    self.cmb_models.addItem(f"#{model.id_string} {model.name}", userData=model)
+                    item_text = f"#{model.id_string} {model.name}"
+                    self.cmb_models.addItem(item_text, userData=model)
+                    self.cmb_models.setItemData(self.cmb_models.count() - 1, item_text, Qt.ItemDataRole.ToolTipRole)
                 
                 if current_sel_id:
                     for i in range(self.cmb_models.count()):
@@ -2355,35 +2380,96 @@ def open_chain_modifier():
             return mapping
         
         def write_renamed_cif(self, input_filename, output_filename, sandwiches):
+            import shlex
             prot_mapping = self.create_renaming_mapping(sandwiches)
             with open(input_filename, 'r') as fin, open(output_filename, 'w') as fout:
-                headers = []
-                in_atom_site = False
-                col_c = col_l = -1
+                in_loop = False
+                loop_headers = []
+                loop_lines = []
+                chain_cols = []
+                
+                def process_and_flush_loop():
+                    if not loop_headers: return
+                    
+                    if not chain_cols:
+                        for h in loop_headers: fout.write(h + "\n")
+                        for l in loop_lines: fout.write(l + "\n")
+                        return
+                    
+                    parsed_rows = []
+                    for line in loop_lines:
+                        try: parts = shlex.split(line)
+                        except ValueError: parts = line.split()
+                        
+                        if len(parts) >= len(loop_headers):
+                            for c_idx in chain_cols:
+                                if c_idx < len(parts):
+                                    old_val = parts[c_idx]
+                                    if old_val in prot_mapping:
+                                        parts[c_idx] = prot_mapping[old_val]
+                            
+                            for i in range(len(parts)):
+                                if ' ' in parts[i] and not (parts[i].startswith("'") or parts[i].startswith('"')):
+                                    parts[i] = f"'{parts[i]}'"
+                            parsed_rows.append(parts)
+                        else:
+                            parsed_rows.append([line.strip()])
+                            
+                    col_widths = [0] * len(loop_headers)
+                    for row in parsed_rows:
+                        if len(row) > 1:
+                            for i, val in enumerate(row):
+                                if i < len(col_widths):
+                                    col_widths[i] = max(col_widths[i], len(val))
+                                    
+                    for h in loop_headers: fout.write(h + "\n")
+                    for row in parsed_rows:
+                        if len(row) == 1:
+                            fout.write(row[0] + "\n")
+                        else:
+                            formatted = []
+                            for i, val in enumerate(row):
+                                if i < len(col_widths):
+                                    formatted.append(val.ljust(col_widths[i]))
+                                else:
+                                    formatted.append(val)
+                            fout.write(" ".join(formatted) + "\n")
+
                 for line in fin:
                     s = line.strip()
-                    if s == "loop_": fout.write(line); continue
-                    if s.startswith("_atom_site."):
-                        in_atom_site = True
-                        headers.append(s.split('.')[1])
-                        fout.write(line); continue
+                    if s == "loop_":
+                        if in_loop: process_and_flush_loop()
+                        in_loop = True
+                        loop_headers = []
+                        loop_lines = []
+                        chain_cols = []
+                        fout.write(line)
+                        continue
                     
-                    if in_atom_site and s and not s.startswith("_") and not s.startswith("#"):
-                        if col_c == -1:
-                            col_c = headers.index("auth_asym_id") if "auth_asym_id" in headers else -1
-                            col_l = headers.index("label_asym_id") if "label_asym_id" in headers else -1
-                        parts = line.split()
-                        if len(parts) >= len(headers):
-                            target_col = col_c if col_c != -1 else col_l
-                            if target_col != -1:
-                                old_chain = parts[target_col]
-                                if old_chain in prot_mapping:
-                                    if col_c != -1: parts[col_c] = prot_mapping[old_chain]
-                                    if col_l != -1: parts[col_l] = prot_mapping[old_chain]
-                                    fout.write(" ".join(parts) + "\n")
-                                    continue
-                    elif s.startswith("#"): in_atom_site = False
+                    if in_loop and s.startswith("_"):
+                        loop_headers.append(s)
+                        if "asym_id" in s or s == "_struct_asym.id" or "pdb_strand_id" in s: 
+                            chain_cols.append(len(loop_headers) - 1)
+                        continue
+                    
+                    if in_loop and s and not s.startswith("#") and not s.startswith("_"):
+                        loop_lines.append(line.rstrip('\r\n'))
+                        continue
+                        
+                    if s.startswith("#"):
+                        if in_loop:
+                            process_and_flush_loop()
+                            in_loop = False
+                        fout.write(line)
+                        continue
+                        
+                    if in_loop:
+                        process_and_flush_loop()
+                        in_loop = False
                     fout.write(line)
+                    
+                if in_loop:
+                    process_and_flush_loop()
 
         def write_trimmed_cif(self, input_path, output_path, keep_chains, keep_het_lines):
             import shlex
@@ -2392,22 +2478,25 @@ def open_chain_modifier():
                 loop_headers = []
                 chain_cols = []
                 is_atom_site = False
+                header_buffer = []
+                wrote_headers = False
                 
                 for i, line in enumerate(fin):
                     s = line.strip()
                     if s == "loop_":
                         in_loop = True; loop_headers = []; chain_cols = []; is_atom_site = False
-                        fout.write(line)
+                        header_buffer = [line]; wrote_headers = False
                         continue
                         
                     if in_loop and s.startswith("_"):
                         loop_headers.append(s)
                         if "asym_id" in s: chain_cols.append(len(loop_headers) - 1)
                         if "_atom_site." in s: is_atom_site = True
-                        fout.write(line)
+                        header_buffer.append(line)
                         continue
                         
                     if in_loop and s and not s.startswith("#") and not s.startswith("_"):
+                        keep_line = True
                         if is_atom_site:
                             parts = s.split()
                             if len(parts) >= len(loop_headers):
@@ -2416,27 +2505,34 @@ def open_chain_modifier():
                                     if "auth_asym_id" in h: target_col = idx; break
                                     elif "label_asym_id" in h: target_col = idx
                                 if target_col != -1 and target_col < len(parts):
-                                    if parts[target_col] in keep_chains or i in keep_het_lines:
-                                        fout.write(line)
-                            continue
+                                    if parts[target_col] not in keep_chains and i not in keep_het_lines:
+                                        keep_line = False
                         elif chain_cols:
                             try: parts = shlex.split(s)
                             except: parts = s.split()
                             if len(parts) >= len(loop_headers):
-                                keep_line = True
                                 for c_idx in chain_cols:
                                     if c_idx < len(parts):
                                         c_val = parts[c_idx]
                                         if c_val not in ["?", "."] and c_val not in keep_chains:
                                             keep_line = False; break
-                                if keep_line: fout.write(line)
-                            continue
-                        else:
+                        
+                        if keep_line:
+                            if not wrote_headers:
+                                fout.writelines(header_buffer)
+                                wrote_headers = True
                             fout.write(line)
-                            continue
+                        continue
                             
-                    if s.startswith("#"): in_loop = False
-                    fout.write(line)
+                    if s.startswith("#"): 
+                        in_loop = False
+                        if wrote_headers or not header_buffer:
+                            fout.write(line)
+                        header_buffer = []
+                        continue
+                        
+                    if not in_loop or wrote_headers:
+                        fout.write(line)
 
         def write_expanded_cif(self, input_path, output_path, layers_to_add, use_auto, manual_twist, manual_rise, water_z_limit=4.0, use_alt=False):
             import numpy as np
@@ -3062,6 +3158,49 @@ def open_chain_modifier():
                 new_sheet_id_counter += 1
 
     # ================== Master Tab Wrapper Class ==================
+    
+    # ====================== DEBUG MODULE START ======================
+    class DebugWidget(QWidget):
+        def __init__(self, pdb_widget_instance, parent=None):
+            super().__init__(parent)
+            self.pdb_widget = pdb_widget_instance
+            self.initUI()
+
+        def initUI(self):
+            layout = QVBoxLayout()
+            
+            lbl = QLabel("<b>Debug Mode: Inspect Raw Files</b><br><br>"
+                         "Save the raw working file <i>before</i> ChimeraX parses and auto-corrects it. "
+                         "This allows you to inspect the exact output of your Python scripts and catch formatting/syntax "
+                         "errors that ChimeraX silently deletes upon loading.<br><br>"
+                         "<i>Note: This fetches the working file from the 'Modifier' tab.</i>")
+            lbl.setWordWrap(True)
+            layout.addWidget(lbl)
+            
+            self.btn_save_raw = QPushButton("Export Raw Working File")
+            self.btn_save_raw.clicked.connect(self.save_raw_file)
+            layout.addWidget(self.btn_save_raw)
+            
+            layout.addStretch()
+            self.setLayout(layout)
+
+        def save_raw_file(self):
+            working_file = self.pdb_widget.working_file_path
+            if not working_file or not os.path.exists(working_file):
+                QMessageBox.warning(self, "No File", "No working file is currently loaded in the Modifier tab.")
+                return
+            
+            ext = ".cif" if working_file.lower().endswith(".cif") else ".pdb"
+            
+            save_path, _ = QFileDialog.getSaveFileName(self, "Save Raw Working File", f"debug_raw{ext}", f"Structure Files (*{ext});;All Files (*)")
+            if save_path:
+                try:
+                    shutil.copy2(working_file, save_path)
+                    QMessageBox.information(self, "Success", f"Raw file successfully exported to:\n{save_path}")
+                except Exception as e:
+                    QMessageBox.critical(self, "Error", f"Failed to export raw file:\n{e}")
+    # ====================== DEBUG MODULE END ========================
+
     class ModifierToolTabs(QTabWidget):
         def __init__(self, tool_instance, session):
             super().__init__()
@@ -3069,6 +3208,11 @@ def open_chain_modifier():
             self.cif_widget = CIFLayerIdentifier(tool_instance, session)
             self.addTab(self.pdb_widget, "Modifier")
             self.addTab(self.cif_widget, "Layer Viewer")
+            
+            # DEBUG TAB
+            #self.debug_widget = DebugWidget(self.pdb_widget)
+            #self.addTab(self.debug_widget, "Debug")
+            # DEBUG TAB
 
     return ModifierToolTabs
 
@@ -3112,6 +3256,18 @@ class PDBModifierTool(ToolInstance):
             QTabBar::tab { background: #252526; border: 1px solid #3e3e42; padding: 6px 12px; color: #d4d4d4; }
             QTabBar::tab:selected { background: #3e3e42; color: #98c379; font-weight: bold; border-bottom: 1px solid #3e3e42; }
             QTabBar::tab:hover { background: #4e4e52; }
+            
+            QScrollBar:vertical { background: transparent; width: 12px; margin: 0px; }
+            QScrollBar::handle:vertical { background-color: #4e4e52; min-height: 20px; border-radius: 5px; margin: 2px; }
+            QScrollBar::handle:vertical:hover, QScrollBar::handle:vertical:pressed { background-color: #98c379; }
+            QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0px; background: transparent; }
+            QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical { background: transparent; }
+            
+            QScrollBar:horizontal { background: transparent; height: 12px; margin: 0px; }
+            QScrollBar::handle:horizontal { background-color: #4e4e52; min-width: 20px; border-radius: 5px; margin: 2px; }
+            QScrollBar::handle:horizontal:hover, QScrollBar::handle:horizontal:pressed { background-color: #98c379; }
+            QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal { width: 0px; background: transparent; }
+            QScrollBar::add-page:horizontal, QScrollBar::sub-page:horizontal { background: transparent; }
         """)
         
     def delete(self):
