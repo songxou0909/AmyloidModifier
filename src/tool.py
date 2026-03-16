@@ -1326,11 +1326,22 @@ def open_chain_modifier():
                     self.text_area.append(f"\n>>>> Applied Expansion (Added {layers_to_add} layers, Alternating: {use_alt})")
 
                 self.reload_working_model()
+                
+                if target_layers > total_layers and getattr(self, 'working_model_id', None):
+                    try:
+                        from chimerax.core.commands import run
+                        run(self.session, f"dssp #{self.working_model_id}")
+                        save_format = "mmcif" if self.working_file_path.lower().endswith('.cif') else "pdb"
+                        run(self.session, f'save "{self.working_file_path}" models #{self.working_model_id} format {save_format}')
+                    except:
+                        pass
+
                 self.process_pdb(self.working_file_path)
                 
                 if target_layers > total_layers:
                     self.text_area.append(f"\nApplied Twist: {applied_twist:.5f}°")
                     self.text_area.append(f"Applied Rise: {applied_rise:.5f} Å")
+                    self.text_area.append("Re-evaluated β-sheet")
                 
             except Exception as e: 
                 QMessageBox.critical(self, "Error", f"Action failed: {e}")
@@ -1496,13 +1507,26 @@ def open_chain_modifier():
             reported_rise = manual_rise
             first_auto_calc = False
 
-            bottom_chains = [s[0] for s in self.final_sandwiches if len(s) > 0]
-            top_chains = [s[-1] for s in self.final_sandwiches if len(s) > 0]
+            all_layer_centroids = []
+            for i in range(len(self.final_sandwiches[0])):
+                layer_chains = [s[i] for s in self.final_sandwiches if len(s) > i]
+                if layer_chains:
+                    layer_com = np.mean([chain_centroids[c] for c in layer_chains if c in chain_centroids], axis=0)
+                    all_layer_centroids.append(layer_com)
             
-            com_bottom = np.mean([chain_centroids[c] for c in bottom_chains if c in chain_centroids], axis=0)
-            com_top = np.mean([chain_centroids[c] for c in top_chains if c in chain_centroids], axis=0)
+            all_layer_centroids = np.array(all_layer_centroids)
             
-            axis_vec = com_top - com_bottom
+            mean_centroid = np.mean(all_layer_centroids, axis=0)
+            centered_points = all_layer_centroids - mean_centroid
+            
+            _, _, Vt = np.linalg.svd(centered_points)
+            
+            axis_vec = Vt[0]
+            
+            rough_vec = all_layer_centroids[-1] - all_layer_centroids[0]
+            if np.dot(axis_vec, rough_vec) < 0:
+                axis_vec = -axis_vec
+                
             axis_len = np.linalg.norm(axis_vec)
             axis_u = axis_vec / axis_len if axis_len > 0 else np.array([0.0, 0.0, 1.0])
                 
@@ -2356,10 +2380,34 @@ def open_chain_modifier():
             if self.working_file_path:
                 het_types = set()
                 try:
+                    is_cif = self.working_file_path.lower().endswith('.cif')
                     with open(self.working_file_path, 'r') as f:
-                        for line in f:
-                            if line.startswith("HETATM") and len(line) >= 20:
-                                het_types.add(line[17:20].strip())
+                        if is_cif:
+                            in_atom_site = False
+                            headers = []
+                            for line in f:
+                                s = line.strip()
+                                if s == "loop_":
+                                    in_atom_site = False
+                                    headers = []
+                                elif s.startswith("_atom_site."):
+                                    in_atom_site = True
+                                    headers.append(s.split('.')[1])
+                                elif in_atom_site and s and not s.startswith("_") and not s.startswith("#"):
+                                    parts = s.split()
+                                    if len(parts) >= len(headers):
+                                        try:
+                                            col_group = headers.index("group_PDB")
+                                            col_res = headers.index("label_comp_id") if "label_comp_id" in headers else headers.index("auth_comp_id")
+                                            if parts[col_group] == "HETATM":
+                                                het_types.add(parts[col_res])
+                                        except ValueError:
+                                            pass
+                        else:
+                            for line in f:
+                                if line.startswith("HETATM") and len(line) >= 20:
+                                    het_types.add(line[17:20].strip())
+                                    
                     alphabet_backwards = "ZYXWVUTSRQPONMLKJIHGFEDCBA"
                     for i, htype in enumerate(sorted(list(het_types))):
                         if i < len(alphabet_backwards):
@@ -2382,6 +2430,31 @@ def open_chain_modifier():
         def write_renamed_cif(self, input_filename, output_filename, sandwiches):
             import shlex
             prot_mapping = self.create_renaming_mapping(sandwiches)
+            
+            het_types = set()
+            try:
+                with open(input_filename, 'r') as f:
+                    in_atom_site = False
+                    headers = []
+                    for line in f:
+                        s = line.strip()
+                        if s == "loop_": in_atom_site = False; headers = []
+                        elif s.startswith("_atom_site."): in_atom_site = True; headers.append(s.split('.')[1])
+                        elif in_atom_site and s and not s.startswith("_") and not s.startswith("#"):
+                            parts = s.split()
+                            if len(parts) >= len(headers):
+                                col_g = headers.index("group_PDB") if "group_PDB" in headers else -1
+                                col_r = headers.index("label_comp_id") if "label_comp_id" in headers else (headers.index("auth_comp_id") if "auth_comp_id" in headers else -1)
+                                if col_g != -1 and col_r != -1 and parts[col_g] == "HETATM":
+                                    het_types.add(parts[col_r])
+            except: pass
+            
+            het_type_map = {}
+            alphabet_backwards = "ZYXWVUTSRQPONMLKJIHGFEDCBA"
+            for i, htype in enumerate(sorted(list(het_types))):
+                if i < len(alphabet_backwards):
+                    het_type_map[htype] = alphabet_backwards[i]
+
             with open(input_filename, 'r') as fin, open(output_filename, 'w') as fout:
                 in_loop = False
                 loop_headers = []
@@ -2402,10 +2475,17 @@ def open_chain_modifier():
                         except ValueError: parts = line.split()
                         
                         if len(parts) >= len(loop_headers):
+                            col_group = loop_headers.index("group_PDB") if "group_PDB" in loop_headers else -1
+                            col_res = loop_headers.index("label_comp_id") if "label_comp_id" in loop_headers else (loop_headers.index("auth_comp_id") if "auth_comp_id" in loop_headers else -1)
+                            is_hetatm = col_group != -1 and parts[col_group] == "HETATM"
+                            res_name = parts[col_res] if col_res != -1 else ""
+
                             for c_idx in chain_cols:
                                 if c_idx < len(parts):
                                     old_val = parts[c_idx]
-                                    if old_val in prot_mapping:
+                                    if is_hetatm and res_name in het_type_map:
+                                        parts[c_idx] = het_type_map[res_name]
+                                    elif old_val in prot_mapping:
                                         parts[c_idx] = prot_mapping[old_val]
                             
                             for i in range(len(parts)):
@@ -2576,6 +2656,29 @@ def open_chain_modifier():
             col_z = headers.index("Cartn_z")
             col_c = headers.index("auth_asym_id") if "auth_asym_id" in headers else headers.index("label_asym_id")
             col_group = headers.index("group_PDB")
+            col_res = headers.index("label_comp_id") if "label_comp_id" in headers else headers.index("auth_comp_id")
+
+            het_types = set()
+            for parts in atom_lines:
+                if parts[col_group] == "HETATM":
+                    het_types.add(parts[col_res])
+
+            reserved_het_chains = {}
+            alphabet_backwards = "ZYXWVUTSRQPONMLKJIHGFEDCBA"
+            for i, htype in enumerate(sorted(list(het_types))):
+                if i < len(alphabet_backwards):
+                    c = alphabet_backwards[i]
+                    reserved_het_chains[htype] = c
+                    used_chain_ids.add(c)
+                else:
+                    idx = 0
+                    while True:
+                        label = self.generate_label(idx)
+                        if label not in used_chain_ids and label not in reserved_het_chains.values():
+                            reserved_het_chains[htype] = label
+                            used_chain_ids.add(label)
+                            break
+                        idx += 1
 
             def get_new_chain_id():
                 idx = 0
@@ -2631,13 +2734,26 @@ def open_chain_modifier():
             reported_twist, reported_rise = manual_twist, manual_rise
             first_auto_calc = False
 
-            bottom_chains = [s[0] for s in self.final_sandwiches if len(s) > 0]
-            top_chains = [s[-1] for s in self.final_sandwiches if len(s) > 0]
+            all_layer_centroids = []
+            for i in range(len(self.final_sandwiches[0])):
+                layer_chains = [s[i] for s in self.final_sandwiches if len(s) > i]
+                if layer_chains:
+                    layer_com = np.mean([chain_centroids[c] for c in layer_chains if c in chain_centroids], axis=0)
+                    all_layer_centroids.append(layer_com)
             
-            com_bottom = np.mean([chain_centroids[c] for c in bottom_chains if c in chain_centroids], axis=0)
-            com_top = np.mean([chain_centroids[c] for c in top_chains if c in chain_centroids], axis=0)
+            all_layer_centroids = np.array(all_layer_centroids)
             
-            axis_vec = com_top - com_bottom
+            mean_centroid = np.mean(all_layer_centroids, axis=0)
+            centered_points = all_layer_centroids - mean_centroid
+            
+            _, _, Vt = np.linalg.svd(centered_points)
+            
+            axis_vec = Vt[0]
+            
+            rough_vec = all_layer_centroids[-1] - all_layer_centroids[0]
+            if np.dot(axis_vec, rough_vec) < 0:
+                axis_vec = -axis_vec
+                
             axis_len = np.linalg.norm(axis_vec)
             axis_u = axis_vec / axis_len if axis_len > 0 else np.array([0.0, 0.0, 1.0])
                 
@@ -2744,30 +2860,6 @@ def open_chain_modifier():
                         new_chain_id = get_new_chain_id()
                         expansions.append((current_ref_chain, new_chain_id, R_top, t_top))
                         current_ref_chain = new_chain_id
-
-            col_res = headers.index("label_comp_id") if "label_comp_id" in headers else headers.index("auth_comp_id")
-            
-            het_types = set()
-            for parts in atom_lines:
-                if parts[col_group] == "HETATM":
-                    het_types.add(parts[col_res])
-
-            reserved_het_chains = {}
-            alphabet_backwards = "ZYXWVUTSRQPONMLKJIHGFEDCBA"
-            for i, htype in enumerate(sorted(list(het_types))):
-                if i < len(alphabet_backwards):
-                    c = alphabet_backwards[i]
-                    reserved_het_chains[htype] = c
-                    used_chain_ids.add(c)
-                else:
-                    idx = 0
-                    while True:
-                        label = self.generate_label(idx)
-                        if label not in used_chain_ids and label not in reserved_het_chains.values():
-                            reserved_het_chains[htype] = label
-                            used_chain_ids.add(label)
-                            break
-                        idx += 1
 
             col_auth_seq = headers.index("auth_seq_id") if "auth_seq_id" in headers else -1
             col_label_seq = headers.index("label_seq_id") if "label_seq_id" in headers else -1
@@ -2887,21 +2979,57 @@ def open_chain_modifier():
 
             def expand_cif_blocks(lines_list):
                 expanded_list = []
-                in_loop = False; loop_headers = []; chain_cols = []
+                in_loop = False
+                loop_headers = []
+                chain_cols = []
+                loop_data_rows = []
                 
+                def flush_loop():
+                    if not loop_data_rows: return
+                    col_widths = [0] * len(loop_headers) if loop_headers else []
+                    
+                    for row in loop_data_rows:
+                        if isinstance(row, list) and len(row) > 1:
+                            for i, val in enumerate(row):
+                                if i < len(col_widths):
+                                    col_widths[i] = max(col_widths[i], len(str(val)))
+                    
+                    for row in loop_data_rows:
+                        if isinstance(row, list) and len(row) > 1:
+                            formatted = []
+                            for i, val in enumerate(row):
+                                if i < len(col_widths):
+                                    formatted.append(str(val).ljust(col_widths[i]))
+                                else:
+                                    formatted.append(str(val))
+                            expanded_list.append(" ".join(formatted) + " \n")
+                        elif isinstance(row, list):
+                            expanded_list.append(str(row[0]) + " \n")
+                        else:
+                            expanded_list.append(row)
+                    loop_data_rows.clear()
+
                 for line in lines_list:
                     s = line.strip()
                     if s == "loop_":
-                        in_loop = True; loop_headers = []; chain_cols = []; expanded_list.append(line); continue
+                        if in_loop: flush_loop()
+                        in_loop = True; loop_headers = []; chain_cols = []
+                        expanded_list.append(line)
+                        continue
                     if in_loop and s.startswith("_"):
                         loop_headers.append(s)
-                        if "asym_id" in s: chain_cols.append(len(loop_headers) - 1)
-                        expanded_list.append(line); continue
-                    if in_loop and s and not s.startswith("#") and not s.startswith("_") and chain_cols:
+                        if "asym_id" in s or "pdb_strand_id" in s: 
+                            chain_cols.append(len(loop_headers) - 1)
+                        expanded_list.append(line)
+                        continue
+                    if in_loop and s and not s.startswith("#") and not s.startswith("_"):
                         try: parts = shlex.split(s)
                         except: parts = s.split()
-                        expanded_list.append(line)
-                        if len(parts) >= len(loop_headers):
+                        
+                        parts_quoted = [f"'{p}'" if ' ' in p and not (p.startswith("'") or p.startswith('"')) else p for p in parts]
+                        loop_data_rows.append(parts_quoted)
+                        
+                        if chain_cols and len(parts) >= len(loop_headers):
                             row_chains = []
                             for c_idx in chain_cols:
                                 if c_idx < len(parts):
@@ -2913,25 +3041,56 @@ def open_chain_modifier():
                                 num_expansions = len(chain_exp_map[row_chains[0]])
                                 if all(len(chain_exp_map[c]) == num_expansions for c in row_chains):
                                     for i in range(num_expansions):
-                                        new_parts = parts[:]
+                                        new_parts = parts_quoted[:]
                                         for c_idx in chain_cols:
                                             if c_idx < len(new_parts):
-                                                old_c = new_parts[c_idx]
+                                                old_c = new_parts[c_idx].strip("'\"")
                                                 if old_c in chain_exp_map:
                                                     new_parts[c_idx] = chain_exp_map[old_c][i]
-                                        new_line = " ".join([f"'{p}'" if ' ' in p else p for p in new_parts]) + "\n"
-                                        expanded_list.append(new_line)
+                                        loop_data_rows.append(new_parts)
                         continue
-                    if s.startswith("#"): in_loop = False
+                    if s.startswith("#"):
+                        if in_loop: flush_loop()
+                        in_loop = False
+                        expanded_list.append(line)
+                        continue
+                    if in_loop and not s:
+                        loop_data_rows.append(line)
+                        continue
+                    if in_loop:
+                        flush_loop()
+                        in_loop = False
+                    
                     expanded_list.append(line)
+                    
+                if in_loop: flush_loop()
                 return expanded_list
 
             pre_lines = expand_cif_blocks(pre_lines)
             post_lines = expand_cif_blocks(post_lines)
 
+            col_widths = []
+            if new_atom_lines:
+                num_cols = max(len(parts) for parts in new_atom_lines)
+                col_widths = [0] * num_cols
+                for parts in new_atom_lines:
+                    for i, part in enumerate(parts):
+                        str_part = f"'{part}'" if ' ' in str(part) and not str(part).startswith("'") and not str(part).startswith('"') else str(part)
+                        col_widths[i] = max(col_widths[i], len(str_part))
+
             with open(output_path, 'w') as fout:
                 for line in pre_lines: fout.write(line)
-                for parts in new_atom_lines: fout.write(" ".join(parts) + "\n")
+                for parts in new_atom_lines:
+                    formatted_parts = []
+                    for i, part in enumerate(parts):
+                        str_part = f"'{part}'" if ' ' in str(part) and not str(part).startswith("'") and not str(part).startswith('"') else str(part)
+                        if i < len(col_widths):
+                            formatted_parts.append(str_part.ljust(col_widths[i]))
+                        else:
+                            formatted_parts.append(str_part)
+                    
+                    fout.write(" ".join(formatted_parts) + " \n")
+                
                 for line in post_lines: fout.write(line)
 
             return reported_twist, reported_rise
@@ -3199,15 +3358,425 @@ def open_chain_modifier():
                     QMessageBox.information(self, "Success", f"Raw file successfully exported to:\n{save_path}")
                 except Exception as e:
                     QMessageBox.critical(self, "Error", f"Failed to export raw file:\n{e}")
-    # ====================== DEBUG MODULE END ========================
+
+    # ====================== Local Resolution Tab ======================
+    class LocalResWidget(QWidget):
+        def __init__(self, tool_instance, session, parent=None):
+            super().__init__(parent)
+            self.tool_instance = tool_instance
+            self.session = session
+            self._last_model_ids = set()
+            self.initUI()
+            
+            self.auto_refresh_timer = QTimer(self)
+            self.auto_refresh_timer.timeout.connect(self.populate_models)
+            self.auto_refresh_timer.start(1000)
+
+        def initUI(self):
+            main_layout = QHBoxLayout(self)
+            splitter = QSplitter(Qt.Orientation.Horizontal)
+            
+            left_widget = QWidget()
+            left_layout = QVBoxLayout(left_widget)
+            
+            grp_models = QGroupBox("Input")
+            form_models = QFormLayout()
+            
+            self.combo_map = QComboBox()
+            self.combo_locres = QComboBox()
+            self.combo_pdb = QComboBox()
+            
+            form_models.addRow("Map:", self.combo_map)
+            form_models.addRow("LocRes Map:", self.combo_locres)
+            form_models.addRow("Model:", self.combo_pdb)
+            
+            grp_models.setLayout(form_models)
+            left_layout.addWidget(grp_models)
+            
+            grp_params = QGroupBox("Color Threshold")
+            form_params = QFormLayout()
+            
+            self.entry_res = QLineEdit("3.0")
+            self.entry_range = QLineEdit("0.2")
+            
+            form_params.addRow("Resolution (Å):", self.entry_res)
+            form_params.addRow("Range:", self.entry_range)
+            
+            grp_params.setLayout(form_params)
+            left_layout.addWidget(grp_params)
+            
+            grp_preview = QGroupBox("Preview Control")
+            v_preview = QVBoxLayout()
+            
+            self.chk_overlay = QCheckBox("Overlay LocRes on Map")
+            self.chk_overlay.setChecked(True)
+            v_preview.addWidget(self.chk_overlay)
+            
+            level_layout = QHBoxLayout()
+            self.lbl_level = QLabel("Level: ")
+            self.lbl_level.setFixedWidth(120)
+            self.slider_level = QSlider(Qt.Orientation.Horizontal)
+            self.slider_level.setRange(0, 1000)
+            self.slider_level.setEnabled(False)
+            level_layout.addWidget(self.lbl_level)
+            level_layout.addWidget(self.slider_level)
+            v_preview.addLayout(level_layout)
+            
+            rms_layout = QHBoxLayout()
+            self.lbl_rms = QLabel("RMS Level: 5.00")
+            self.lbl_rms.setFixedWidth(120)
+            self.slider_rms = QSlider(Qt.Orientation.Horizontal)
+            self.slider_rms.setRange(0, 400)
+            self.slider_rms.setEnabled(False)
+            rms_layout.addWidget(self.lbl_rms)
+            rms_layout.addWidget(self.slider_rms)
+            v_preview.addLayout(rms_layout)
+            
+            grp_preview.setLayout(v_preview)
+            left_layout.addWidget(grp_preview)
+            
+            left_layout.addStretch()
+            
+            self.btn_run = QPushButton("Run")
+            self.btn_run.setStyleSheet("font-weight: bold; padding: 10px;")
+            self.btn_run.clicked.connect(self.execute_commands)
+            left_layout.addWidget(self.btn_run)
+            
+            right_widget = QWidget()
+            right_layout = QVBoxLayout(right_widget)
+            
+            self.fig = Figure(figsize=(5, 5), dpi=100)
+            self.fig.patch.set_facecolor('#1e1e1e')
+            self.ax = self.fig.add_subplot(111)
+            self.ax.set_facecolor('#1e1e1e')
+            self.ax.axis('off')
+            self.ax.text(0.5, 0.5, "Select Maps to Preview", color='white', 
+                         fontsize=12, ha='center', va='center', transform=self.ax.transAxes)
+            
+            self.canvas = FigureCanvas(self.fig)
+            right_layout.addWidget(self.canvas)
+            
+            splitter.addWidget(left_widget)
+            splitter.addWidget(right_widget)
+            splitter.setStretchFactor(0, 6)
+            splitter.setStretchFactor(1, 4)
+            
+            main_layout.addWidget(splitter)
+            
+            self.slider_level.valueChanged.connect(self.on_level_changed)
+            self.slider_rms.valueChanged.connect(self.on_rms_changed)
+            self.chk_overlay.toggled.connect(self.draw_plot)
+            self.entry_res.textChanged.connect(self.draw_plot)
+            self.entry_range.textChanged.connect(self.draw_plot)
+            self.combo_map.currentIndexChanged.connect(self.draw_plot)
+            self.combo_locres.currentIndexChanged.connect(self.draw_plot)
+            self.combo_pdb.currentIndexChanged.connect(self.draw_plot)
+            
+            self.data_map = None
+            self.data_locres = None
+            self.map_min = 0
+            self.map_max = 1
+            self.map_rms = 1.0
+            self._updating_sliders = False
+
+        def on_level_changed(self, value):
+            if self._updating_sliders: return
+            self._updating_sliders = True
+            
+            if hasattr(self, 'map_rms') and self.map_rms > 0:
+                slider_frac = value / 1000.0
+                current_threshold = self.map_min + slider_frac * (self.map_max - self.map_min)
+                current_rms_level = current_threshold / self.map_rms
+                
+                rms_val_int = int(current_rms_level * 40)
+                self.slider_rms.blockSignals(True)
+                self.slider_rms.setValue(max(0, min(400, rms_val_int)))
+                self.slider_rms.blockSignals(False)
+                self.lbl_rms.setText(f"RMS Level: {current_rms_level:.2f}")
+
+            self.draw_plot()
+            self._updating_sliders = False
+
+        def on_rms_changed(self, value):
+            if self._updating_sliders: return
+            self._updating_sliders = True
+            
+            if hasattr(self, 'map_rms') and self.map_rms > 0:
+                snapped_value = round(value / 10) * 10
+                if snapped_value != value:
+                    self.slider_rms.blockSignals(True)
+                    self.slider_rms.setValue(snapped_value)
+                    self.slider_rms.blockSignals(False)
+                    
+                rms_level = snapped_value / 40.0
+                current_threshold = rms_level * self.map_rms
+                
+                if self.map_max > self.map_min:
+                    slider_frac = (current_threshold - self.map_min) / (self.map_max - self.map_min)
+                    level_val_int = int(slider_frac * 1000)
+                    self.slider_level.blockSignals(True)
+                    self.slider_level.setValue(max(0, min(1000, level_val_int)))
+                    self.slider_level.blockSignals(False)
+                    
+                self.lbl_rms.setText(f"RMS Level: {rms_level:.2f}")
+
+            self.draw_plot()
+            self._updating_sliders = False
+
+        def populate_models(self):
+            current_models = self.session.models.list()
+            current_ids = {(m.id_string, id(m), m.name) for m in current_models}
+            
+            if current_ids != self._last_model_ids:
+                def update_combo(combo):
+                    curr_data = combo.currentData()
+                    curr_id = curr_data.id_string if curr_data else None
+                    combo.blockSignals(True)
+                    combo.clear()
+                    for m in current_models:
+                        combo.addItem(f"#{m.id_string} {m.name}", userData=m)
+                    if curr_id:
+                        for i in range(combo.count()):
+                            if combo.itemData(i).id_string == curr_id:
+                                combo.setCurrentIndex(i)
+                                break
+                    combo.blockSignals(False)
+
+                update_combo(self.combo_map)
+                update_combo(self.combo_locres)
+                update_combo(self.combo_pdb)
+                
+                for i in range(self.combo_map.count()):
+                    m = self.combo_map.itemData(i)
+                    if not m: continue
+                    
+                    name_lower = getattr(m, 'name', '').lower()
+                    is_vol = hasattr(m, 'data')
+                    is_atomic = hasattr(m, 'atoms')
+
+                    if is_vol and "locres" in name_lower:
+                        curr = self.combo_locres.currentData()
+                        if not curr or "locres" not in getattr(curr, 'name', '').lower():
+                            self.combo_locres.setCurrentIndex(i)
+                    
+                    elif is_vol and "locres" not in name_lower:
+                        curr = self.combo_map.currentData()
+                        if not curr or not hasattr(curr, 'data') or "locres" in getattr(curr, 'name', '').lower():
+                            self.combo_map.setCurrentIndex(i)
+                            
+                    elif is_atomic:
+                        curr = self.combo_pdb.currentData()
+                        if not curr or not hasattr(curr, 'atoms'):
+                            self.combo_pdb.setCurrentIndex(i)
+
+                self._last_model_ids = current_ids
+                self.draw_plot()
+
+        def load_data(self):
+            map_model = self.combo_map.currentData()
+            locres_model = self.combo_locres.currentData()
+            
+            if not map_model or not locres_model: return False
+            
+            if getattr(self, '_loaded_map', None) == map_model and getattr(self, '_loaded_locres', None) == locres_model:
+                return True
+            
+            try:
+                self.data_map = map_model.data.matrix().astype(np.float32)
+                self.data_locres = locres_model.data.matrix().astype(np.float32)
+                
+                self.map_min = float(np.min(self.data_map))
+                self.map_max = float(np.max(self.data_map))
+                if self.map_max == self.map_min:
+                    self.map_max = self.map_min + 1.0
+                    
+                self.map_rms = float(np.sqrt(np.mean(np.square(self.data_map))))
+                default_rms_level = 5.0
+                default_thresh = float(default_rms_level * self.map_rms)
+                
+                default_slider_val = int(1000 * (default_thresh - self.map_min) / (self.map_max - self.map_min))
+                default_slider_val = max(0, min(1000, default_slider_val))
+                
+                self.slider_level.blockSignals(True)
+                self.slider_level.setValue(default_slider_val)
+                self.slider_level.setEnabled(True)
+                self.slider_level.blockSignals(False)
+                
+                self.slider_rms.blockSignals(True)
+                self.slider_rms.setValue(int(default_rms_level * 40))
+                self.slider_rms.setEnabled(True)
+                self.slider_rms.blockSignals(False)
+                self.lbl_rms.setText(f"RMS Level: {default_rms_level:.2f}")
+                
+                if self.data_map.shape == self.data_locres.shape:
+                    mask = self.data_map > default_thresh
+                    valid_locres = self.data_locres[mask]
+                    if len(valid_locres) > 0:
+                        optimal_res = round(float(np.percentile(valid_locres, 30)), 1)
+                        self.entry_res.blockSignals(True)
+                        self.entry_res.setText(f"{optimal_res:.1f}")
+                        self.entry_res.blockSignals(False)
+                
+                self._loaded_map = map_model
+                self._loaded_locres = locres_model
+                return True
+            except Exception:
+                return False
+
+        def draw_plot(self):
+            if not self.load_data() or self.data_map is None or self.data_locres is None:
+                self.ax.clear()
+                self.ax.axis('off')
+                self.ax.text(0.5, 0.5, "Select Maps to Preview", color='white', 
+                             fontsize=12, ha='center', va='center', transform=self.ax.transAxes)
+                self.canvas.draw_idle()
+                
+                self.slider_level.blockSignals(True)
+                self.slider_level.setValue(0)
+                self.slider_level.setEnabled(False)
+                self.slider_level.blockSignals(False)
+                self.lbl_level.setText("Level: ")
+                
+                self.slider_rms.blockSignals(True)
+                self.slider_rms.setValue(200)
+                self.slider_rms.setEnabled(False)
+                self.slider_rms.blockSignals(False)
+                self.lbl_rms.setText("RMS Level: 5.00")
+                
+                return
+                
+            import matplotlib.colors as mcolors
+            
+            try:
+                r = float(self.entry_res.text().strip())
+                rg = float(self.entry_range.text().strip())
+            except ValueError:
+                return
+
+            max_z = self.data_map.shape[0]
+            current_z = max_z // 2
+            slice_thickness = 5
+            
+            slider_frac = self.slider_level.value() / 1000.0
+            current_threshold = self.map_min + slider_frac * (self.map_max - self.map_min)
+            self.lbl_level.setText(f"Level: {current_threshold:.4f}")
+
+            z_start = max(0, current_z - slice_thickness // 2)
+            z_end = min(max_z, current_z + slice_thickness // 2 + 1)
+
+            slice_map = np.mean(self.data_map[z_start:z_end, :, :], axis=0)
+            
+            if self.data_map.shape == self.data_locres.shape:
+                slice_locres = np.mean(self.data_locres[z_start:z_end, :, :], axis=0)
+            else:
+                self.ax.clear()
+                self.ax.axis('off')
+                self.ax.text(0.5, 0.5, "Maps do not match!", color='red', 
+                             fontsize=12, ha='center', va='center', transform=self.ax.transAxes)
+                self.canvas.draw_idle()
+                return
+
+            self.ax.clear()
+            self.ax.axis('off')
+
+            import matplotlib.patches as patches
+            
+            center_y, center_x = slice_map.shape[0] / 2, slice_map.shape[1] / 2
+            radius = min(slice_map.shape) * 0.3 
+            
+            clip_circle = patches.Circle((center_x, center_y), radius, transform=self.ax.transData)
+            
+            img_base = self.ax.imshow(slice_map, cmap='gray', origin='lower')
+            img_base.set_clip_path(clip_circle)
+
+            if self.chk_overlay.isChecked():
+                cmap = mcolors.LinearSegmentedColormap.from_list("rwb", ["red", "white", "blue"])
+                vmin = r - rg
+                vmax = r + rg
+                norm = mcolors.Normalize(vmin=vmin, vmax=vmax)
+
+                import scipy.ndimage
+                base_mask = np.where(slice_map > current_threshold, 1.0, 0.0)
+                smooth_mask = scipy.ndimage.gaussian_filter(base_mask, sigma=0.8)
+                alpha_mask = np.clip(smooth_mask * 1.5, 0.0, 0.9) 
+                
+                rgba_img = cmap(norm(slice_locres))
+                rgba_img[..., 3] = alpha_mask 
+
+                img_overlay = self.ax.imshow(rgba_img, origin='lower', interpolation='bilinear')
+                img_overlay.set_clip_path(clip_circle)
+
+            self.ax.set_xlim(center_x - radius * 1.05, center_x + radius * 1.05)
+            self.ax.set_ylim(center_y - radius * 1.05, center_y + radius * 1.05)
+
+            self.canvas.draw_idle()
+
+        def execute_commands(self):
+            map_model = self.combo_map.currentData()
+            locres_model = self.combo_locres.currentData()
+            pdb_model = self.combo_pdb.currentData()
+
+            if not all([map_model, locres_model, pdb_model]):
+                QMessageBox.critical(self, "Error", "Please select valid Map, LocRes, and PDB models.")
+                return
+
+            map_id = map_model.id_string
+            locres_id = locres_model.id_string
+            pdb_id = pdb_model.id_string
+
+            try:
+                res_val = float(self.entry_res.text().strip())
+                range_val = float(self.entry_range.text().strip())
+            except ValueError:
+                QMessageBox.critical(self, "Error", "Resolution and Range must be numbers")
+                return
+
+            low = res_val - range_val
+            mid = res_val
+            high = res_val + range_val
+
+            commands = f"""
+color sample #{map_id} map #{locres_id} palette {low:.1f},#ff0000:{mid:.1f},#ffffff:{high:.1f},#0000ff 
+surface dust #{map_id}
+set bgColor #ffffff00
+hide #{locres_id} models 
+graphics silhouettes true
+graphics silhouette width 20
+ui tool show "Surface Color"
+key red-white-blue :{low:.1f}Å :{mid:.1f}Å :{high:.1f}Å
+key fontSize 14
+key pos 0.8000,0.06000
+key size 0.15000,0.03000
+key borderWidth 3.0
+surface zone #{map_id} near #{pdb_id}
+hide #{pdb_id} models 
+hide #{locres_id} models
+view orient
+zoom pixelSize 0.18
+scalebar 10 xpos 0.01 ypos 0.01
+2dlabels create scalebar_legend text "10 Å" xpos 0.01 ypos 0.02 size 20
+volume #{map_id} step 1
+volume #{map_id} rmsLevel {self.slider_rms.value() / 40.0:.2f}
+lighting soft
+"""
+            from chimerax.core.commands import run
+            for cmd in commands.strip().split('\n'):
+                if cmd.strip():
+                    try:
+                        run(self.session, cmd.strip())
+                    except Exception as e:
+                        print(f"Command failed: {cmd}\n{e}")
 
     class ModifierToolTabs(QTabWidget):
         def __init__(self, tool_instance, session):
             super().__init__()
             self.pdb_widget = PDBLayerIdentifier(tool_instance, session)
             self.cif_widget = CIFLayerIdentifier(tool_instance, session)
+            self.localres_widget = LocalResWidget(tool_instance, session)
+            
             self.addTab(self.pdb_widget, "Modifier")
             self.addTab(self.cif_widget, "Layer Viewer")
+            self.addTab(self.localres_widget, "LocalRes")
             
             # DEBUG TAB
             #self.debug_widget = DebugWidget(self.pdb_widget)
@@ -3248,10 +3817,17 @@ class PDBModifierTool(ToolInstance):
             QGroupBox::title { subcontrol-origin: margin; subcontrol-position: top left; padding: 0 5px; }
             QCheckBox::indicator { width: 14px; height: 14px; border: 1px solid #555; border-radius: 2px; background-color: #1e1e1e; }
             QCheckBox::indicator:checked { background-color: #98c379; border: 1px solid #98c379; }
+            
             QSlider:vertical { min-width: 20px; }
             QSlider::groove:vertical { background: #3c3c3c; width: 6px; border-radius: 3px; }
             QSlider::handle:vertical { background: #98c379; height: 14px; width: 14px; margin: 0 -4px; border-radius: 7px; }
             QSlider::handle:vertical:hover { background: #b5e890; }
+            
+            QSlider:horizontal { min-height: 20px; }
+            QSlider::groove:horizontal { background: #3c3c3c; height: 6px; border-radius: 3px; }
+            QSlider::handle:horizontal { background: #98c379; height: 14px; width: 14px; margin: -4px 0; border-radius: 7px; }
+            QSlider::handle:horizontal:hover { background: #b5e890; }
+            
             QTabWidget::pane { border: 1px solid #3e3e42; top: -1px; }
             QTabBar::tab { background: #252526; border: 1px solid #3e3e42; padding: 6px 12px; color: #d4d4d4; }
             QTabBar::tab:selected { background: #3e3e42; color: #98c379; font-weight: bold; border-bottom: 1px solid #3e3e42; }
