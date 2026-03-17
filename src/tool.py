@@ -812,6 +812,15 @@ def open_chain_modifier():
             hb_trim.addStretch()
             v_ops.addLayout(hb_trim)
 
+            hb_pf_trim = QHBoxLayout()
+            self.btn_remove_pf = QPushButton("Trim Protofilament")
+            self.btn_remove_pf.setToolTip("Trim away the selected protofilament entirely")
+            self.btn_remove_pf.clicked.connect(self.action_remove_pf)
+            hb_pf_trim.addWidget(self.btn_remove_pf)
+            self.cmb_protofilaments = QComboBox()
+            hb_pf_trim.addWidget(self.cmb_protofilaments)
+            v_ops.addLayout(hb_pf_trim)
+
             hb_ren = QHBoxLayout()
             self.btn_rename = QPushButton("Rename Chains")
             self.btn_rename.clicked.connect(self.action_rename)
@@ -1166,6 +1175,52 @@ def open_chain_modifier():
                         
             except Exception as e:
                 self.text_area.append(f"\nModel display warning: {e}")
+
+        def action_remove_pf(self):
+            if not self.working_file_path or not self.final_sandwiches: return
+            if self.cmb_protofilaments.count() == 0: return
+            
+            self.sync_viewer_to_file()
+            try:
+                pf_index = self.cmb_protofilaments.currentData()
+                if pf_index is None or pf_index < 0 or pf_index >= len(self.final_sandwiches): return
+                
+                total_layers = self.detected_layers
+                keep_chains = set()
+                
+                for i, sandwich in enumerate(self.final_sandwiches):
+                    if i != pf_index:
+                        for chain_id in sandwich:
+                            keep_chains.add(chain_id)
+                            
+                if not keep_chains:
+                    QMessageBox.warning(self, "Warning", "Cannot remove the last remaining protofilament.")
+                    return
+                
+                mid_chain = self.final_sandwiches[pf_index][len(self.final_sandwiches[pf_index])//2]
+                self.text_area.append(f"Removing Protofilament with middle chain {mid_chain}...")
+                
+                new_temp = self.working_file_path + ".tmp"
+                valid_layer_indices = range(total_layers)
+                xy_lim = self.get_param(self.edit_xy_limit, 3.0)
+                water_z_limit = self.get_param(self.edit_water_z, 4.0)
+                
+                keep_het_lines = self.get_kept_heteroatoms(valid_layer_indices, xy_lim, water_z_limit)
+                
+                if self.working_file_path.lower().endswith('.cif'):
+                    self.write_trimmed_cif(self.working_file_path, new_temp, keep_chains, keep_het_lines)
+                else:
+                    self.write_trimmed_pdb(self.working_file_path, new_temp, keep_chains, keep_het_lines)
+                    
+                import shutil
+                shutil.move(new_temp, self.working_file_path)
+                self.text_area.append("\n>>>> Applied Protofilament Trimming")
+                
+                self.reload_working_model()
+                self.process_pdb(self.working_file_path)
+                
+            except Exception as e:
+                QMessageBox.critical(self, "Error", f"Action failed: {e}")
 
         def action_rename(self):
             if not self.working_file_path: return
@@ -2173,6 +2228,14 @@ def open_chain_modifier():
                 else: self.detected_layers = 0
                 
                 self.btn_beta.setEnabled(self.detected_layers > 1)
+
+                self.cmb_protofilaments.blockSignals(True)
+                self.cmb_protofilaments.clear()
+                if self.final_sandwiches:
+                    for i, pf in enumerate(self.final_sandwiches):
+                        mid_chain = pf[len(pf)//2] if pf else "?"
+                        self.cmb_protofilaments.addItem(f"PF with Chain {mid_chain}", userData=i)
+                self.cmb_protofilaments.blockSignals(False)
 
                 output_lines = []
                 output_lines.append("--------------- Analysis Result ---------------")
@@ -3445,7 +3508,7 @@ def open_chain_modifier():
             right_widget = QWidget()
             right_layout = QVBoxLayout(right_widget)
             
-            self.fig = Figure(figsize=(5, 5), dpi=100)
+            self.fig = Figure(figsize=(3, 3), dpi=100)
             self.fig.patch.set_facecolor('#1e1e1e')
             self.ax = self.fig.add_subplot(111)
             self.ax.set_facecolor('#1e1e1e')
@@ -3528,46 +3591,53 @@ def open_chain_modifier():
             current_ids = {(m.id_string, id(m), m.name) for m in current_models}
             
             if current_ids != self._last_model_ids:
-                def update_combo(combo):
+                vol_models = [m for m in current_models if hasattr(m, 'data')]
+                atomic_models = [m for m in current_models if hasattr(m, 'atoms')]
+
+                def update_combo(combo, allowed_models):
                     curr_data = combo.currentData()
                     curr_id = curr_data.id_string if curr_data else None
                     combo.blockSignals(True)
                     combo.clear()
-                    for m in current_models:
+                    combo.addItem("--- Select ---", userData=None)
+                    for m in allowed_models:
                         combo.addItem(f"#{m.id_string} {m.name}", userData=m)
+                    
                     if curr_id:
                         for i in range(combo.count()):
-                            if combo.itemData(i).id_string == curr_id:
+                            m_data = combo.itemData(i)
+                            if m_data and m_data.id_string == curr_id:
                                 combo.setCurrentIndex(i)
                                 break
                     combo.blockSignals(False)
 
-                update_combo(self.combo_map)
-                update_combo(self.combo_locres)
-                update_combo(self.combo_pdb)
+                update_combo(self.combo_map, vol_models)
+                update_combo(self.combo_locres, vol_models)
+                update_combo(self.combo_pdb, atomic_models)
                 
-                for i in range(self.combo_map.count()):
+                for i in range(1, self.combo_map.count()):
                     m = self.combo_map.itemData(i)
                     if not m: continue
                     
                     name_lower = getattr(m, 'name', '').lower()
-                    is_vol = hasattr(m, 'data')
-                    is_atomic = hasattr(m, 'atoms')
+                    locres_keywords = ["locres", "localres", "local_res", "loc_res"]
+                    is_locres_map = any(kw in name_lower for kw in locres_keywords)
 
-                    if is_vol and "locres" in name_lower:
+                    if is_locres_map:
                         curr = self.combo_locres.currentData()
-                        if not curr or "locres" not in getattr(curr, 'name', '').lower():
+                        if not curr or not any(kw in getattr(curr, 'name', '').lower() for kw in locres_keywords):
                             self.combo_locres.setCurrentIndex(i)
-                    
-                    elif is_vol and "locres" not in name_lower:
+                    else:
                         curr = self.combo_map.currentData()
-                        if not curr or not hasattr(curr, 'data') or "locres" in getattr(curr, 'name', '').lower():
+                        if not curr or any(kw in getattr(curr, 'name', '').lower() for kw in locres_keywords):
                             self.combo_map.setCurrentIndex(i)
                             
-                    elif is_atomic:
-                        curr = self.combo_pdb.currentData()
-                        if not curr or not hasattr(curr, 'atoms'):
-                            self.combo_pdb.setCurrentIndex(i)
+                for i in range(1, self.combo_pdb.count()):
+                    m = self.combo_pdb.itemData(i)
+                    if not m: continue
+                    curr = self.combo_pdb.currentData()
+                    if not curr:
+                        self.combo_pdb.setCurrentIndex(i)
 
                 self._last_model_ids = current_ids
                 self.draw_plot()
@@ -3716,8 +3786,8 @@ def open_chain_modifier():
             locres_model = self.combo_locres.currentData()
             pdb_model = self.combo_pdb.currentData()
 
-            if not all([map_model, locres_model, pdb_model]):
-                QMessageBox.critical(self, "Error", "Please select valid Map, LocRes, and PDB models.")
+            if not map_model or not locres_model or not pdb_model:
+                QMessageBox.warning(self, "Missing Selection", "Please ensure all inputs are provided")
                 return
 
             map_id = map_model.id_string
@@ -3778,6 +3848,13 @@ lighting soft
             self.addTab(self.cif_widget, "Layer Viewer")
             self.addTab(self.localres_widget, "LocalRes")
             
+            max_min_height = max(
+                self.pdb_widget.minimumSizeHint().height(),
+                self.cif_widget.minimumSizeHint().height(),
+                self.localres_widget.minimumSizeHint().height()
+            )
+            self.setMinimumHeight(max_min_height)
+            
             # DEBUG TAB
             #self.debug_widget = DebugWidget(self.pdb_widget)
             #self.addTab(self.debug_widget, "Debug")
@@ -3828,6 +3905,7 @@ class PDBModifierTool(ToolInstance):
             QSlider::handle:horizontal { background: #98c379; height: 14px; width: 14px; margin: -4px 0; border-radius: 7px; }
             QSlider::handle:horizontal:hover { background: #b5e890; }
             
+            QTabWidget::tab-bar { alignment: left; }
             QTabWidget::pane { border: 1px solid #3e3e42; top: -1px; }
             QTabBar::tab { background: #252526; border: 1px solid #3e3e42; padding: 6px 12px; color: #d4d4d4; }
             QTabBar::tab:selected { background: #3e3e42; color: #98c379; font-weight: bold; border-bottom: 1px solid #3e3e42; }
