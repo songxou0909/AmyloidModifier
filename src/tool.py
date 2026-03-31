@@ -539,6 +539,36 @@ def open_chain_modifier():
 
         def reload_working_model(self):
             target_id = getattr(self, 'working_model_id', None)
+            
+            # --- Capture current display state ---
+            captured_state = False
+            was_cartoon_visible = False
+            was_atom_visible = True
+            atom_style = None
+            
+            try:
+                from chimerax.atomic import AtomicStructure
+                for m in self.session.models.list(type=AtomicStructure):
+                    if m.id_string == target_id:
+                        captured_state = True
+                        if hasattr(m, 'residues') and len(m.residues) > 0:
+                            was_cartoon_visible = any(getattr(r, 'ribbon_display', False) for r in m.residues)
+                        if hasattr(m, 'atoms') and len(m.atoms) > 0:
+                            was_atom_visible = any(getattr(a, 'display', True) for a in m.atoms)
+                            for a in m.atoms:
+                                if getattr(a, 'display', False):
+                                    mode_val = getattr(a, 'draw_mode', 2)
+                                    mode_str = str(mode_val).lower()
+                                    if mode_val == 0 or "sphere" in mode_str: atom_style = "sphere"
+                                    elif mode_val == 1 or "ball" in mode_str: atom_style = "ball"
+                                    elif mode_val == 3 or "wire" in mode_str: atom_style = "wire"
+                                    else: atom_style = "stick"
+                                    break
+                        break
+            except Exception:
+                pass
+            # -------------------------------------
+            
             try:
                 from chimerax.core.commands import run
                 
@@ -559,6 +589,17 @@ def open_chain_modifier():
                         self.working_model_id = first_model.id_string
                         self._last_live_atom_count = len(first_model.atoms) if hasattr(first_model, 'atoms') else 0
                         run(self.session, f"color #{self.working_model_id} bypolymer")
+                        
+                        # --- Restore display state ---
+                        if captured_state:
+                            if was_cartoon_visible: run(self.session, f"show #{self.working_model_id} cartoons")
+                            else: run(self.session, f"hide #{self.working_model_id} cartoons")
+                            
+                            if was_atom_visible:
+                                run(self.session, f"show #{self.working_model_id} atoms")
+                                if atom_style: run(self.session, f"style #{self.working_model_id} {atom_style}")
+                            else: run(self.session, f"hide #{self.working_model_id} atoms")
+                        # -----------------------------
                 
                 try: run(self.session, "view chimerax_modifier_locked_view")
                 except: pass
@@ -809,16 +850,35 @@ def open_chain_modifier():
             self.edit_trim.setValidator(QIntValidator(1, 500))
             self.edit_trim.setFixedWidth(50)
             hb_trim.addWidget(self.edit_trim)
+
+            self.chk_fit_map = QCheckBox("Fit to Map")
+            self.chk_fit_map.setToolTip("Perform a Fit-to-Map operation on the structure after trimming/expanding.")
+            self.chk_fit_map.toggled.connect(self.on_fit_map_toggled)
+            self.fit_map_model_id = None
+            self.fit_map_mode = None
+            hb_trim.addWidget(self.chk_fit_map)
+
             hb_trim.addStretch()
             v_ops.addLayout(hb_trim)
 
             hb_pf_trim = QHBoxLayout()
-            self.btn_remove_pf = QPushButton("Trim Protofilament")
+            
+            self.btn_remove_pf = QPushButton("Trim")
+            self.btn_remove_pf.setFixedWidth(70)
             self.btn_remove_pf.setToolTip("Trim away the selected protofilament entirely")
             self.btn_remove_pf.clicked.connect(self.action_remove_pf)
             hb_pf_trim.addWidget(self.btn_remove_pf)
+
+            self.btn_select_pf = QPushButton("Select")
+            self.btn_select_pf.setFixedWidth(70)
+            self.btn_select_pf.setToolTip("Select the entire chosen protofilament in ChimeraX")
+            self.btn_select_pf.clicked.connect(self.action_select_pf)
+            hb_pf_trim.addWidget(self.btn_select_pf)
+
             self.cmb_protofilaments = QComboBox()
-            hb_pf_trim.addWidget(self.cmb_protofilaments)
+            self.cmb_protofilaments.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+            hb_pf_trim.addWidget(self.cmb_protofilaments, 1)
+            
             v_ops.addLayout(hb_pf_trim)
 
             hb_ren = QHBoxLayout()
@@ -921,6 +981,58 @@ def open_chain_modifier():
 
             main_layout.addWidget(splitter)
             self.setLayout(main_layout)
+
+        def on_fit_map_toggled(self, checked):
+            if not checked:
+                self.fit_map_model_id = None
+                self.fit_map_mode = None
+                return
+
+            vols = [m for m in self.session.models.list() if hasattr(m, 'data')]
+            if not vols:
+                QMessageBox.warning(self, "No Maps", "No map/volume models currently loaded in ChimeraX.")
+                self.chk_fit_map.blockSignals(True)
+                self.chk_fit_map.setChecked(False)
+                self.chk_fit_map.blockSignals(False)
+                return
+
+            dialog = QDialog(self)
+            dialog.setWindowTitle("Fit to Map Options")
+            layout = QVBoxLayout(dialog)
+            
+            layout.addWidget(QLabel("Select the target map (.mrc):"))
+            combo = QComboBox()
+            for v in vols:
+                combo.addItem(f"#{v.id_string} {v.name}", userData=v.id_string)
+            layout.addWidget(combo)
+            
+            layout.addWidget(QLabel("Select fitting mode:"))
+            from PyQt6.QtWidgets import QRadioButton
+            radio_whole = QRadioButton("Fit as a whole")
+            radio_whole.setToolTip("Performs a global Fit-to-Map on the entire structure after trimming/expanding. This preserves symmetry but may not capture local variations.")
+            radio_chain = QRadioButton("Fit as per chain")
+            radio_chain.setToolTip("Performs a per-chain Fit-to-Map after trimming/expanding. This sacrifices symmetry for a more realistic fit.")
+            radio_whole.setChecked(True)
+            
+            layout.addWidget(radio_whole)
+            layout.addWidget(radio_chain)
+            
+            btn_box = QHBoxLayout()
+            btn_ok = QPushButton("OK")
+            btn_ok.clicked.connect(dialog.accept)
+            btn_cancel = QPushButton("Cancel")
+            btn_cancel.clicked.connect(dialog.reject)
+            btn_box.addWidget(btn_ok)
+            btn_box.addWidget(btn_cancel)
+            layout.addLayout(btn_box)
+
+            if dialog.exec() == QDialog.DialogCode.Accepted:
+                self.fit_map_model_id = combo.currentData()
+                self.fit_map_mode = "whole" if radio_whole.isChecked() else "chain"
+            else:
+                self.chk_fit_map.blockSignals(True)
+                self.chk_fit_map.setChecked(False)
+                self.chk_fit_map.blockSignals(False)
         
         def sync_viewer_to_file(self):
             """Silently saves the live ChimeraX model back to the working file."""
@@ -1148,6 +1260,35 @@ def open_chain_modifier():
         def reload_working_model(self):
             target_id = self.working_model_id
             
+            # --- Capture current display state ---
+            captured_state = False
+            was_cartoon_visible = False
+            was_atom_visible = True
+            atom_style = None
+            
+            try:
+                from chimerax.atomic import AtomicStructure
+                for m in self.session.models.list(type=AtomicStructure):
+                    if m.id_string == target_id:
+                        captured_state = True
+                        if hasattr(m, 'residues') and len(m.residues) > 0:
+                            was_cartoon_visible = any(getattr(r, 'ribbon_display', False) for r in m.residues)
+                        if hasattr(m, 'atoms') and len(m.atoms) > 0:
+                            was_atom_visible = any(getattr(a, 'display', True) for a in m.atoms)
+                            for a in m.atoms:
+                                if getattr(a, 'display', False):
+                                    mode_val = getattr(a, 'draw_mode', 2)
+                                    mode_str = str(mode_val).lower()
+                                    if mode_val == 0 or "sphere" in mode_str: atom_style = "sphere"
+                                    elif mode_val == 1 or "ball" in mode_str: atom_style = "ball"
+                                    elif mode_val == 3 or "wire" in mode_str: atom_style = "wire"
+                                    else: atom_style = "stick"
+                                    break
+                        break
+            except Exception:
+                pass
+            # -------------------------------------
+            
             try:
                 from chimerax.core.commands import run
                 
@@ -1169,6 +1310,17 @@ def open_chain_modifier():
                         self.working_model_id = first_model.id_string
                         self._last_live_atom_count = len(first_model.atoms) if hasattr(first_model, 'atoms') else 0
                         run(self.session, f"color #{self.working_model_id} bypolymer")
+                        
+                        # --- Restore display state ---
+                        if captured_state:
+                            if was_cartoon_visible: run(self.session, f"show #{self.working_model_id} cartoons")
+                            else: run(self.session, f"hide #{self.working_model_id} cartoons")
+                            
+                            if was_atom_visible:
+                                run(self.session, f"show #{self.working_model_id} atoms")
+                                if atom_style: run(self.session, f"style #{self.working_model_id} {atom_style}")
+                            else: run(self.session, f"hide #{self.working_model_id} atoms")
+                        # -----------------------------
                 
                 try: run(self.session, "view chimerax_modifier_locked_view")
                 except: pass
@@ -1221,6 +1373,28 @@ def open_chain_modifier():
                 
             except Exception as e:
                 QMessageBox.critical(self, "Error", f"Action failed: {e}")
+
+        def action_select_pf(self):
+            if not getattr(self, 'working_model_id', None) or not getattr(self, 'final_sandwiches', []): return
+            if self.cmb_protofilaments.count() == 0: return
+            
+            try:
+                pf_index = self.cmb_protofilaments.currentData()
+                if pf_index is None or pf_index < 0 or pf_index >= len(self.final_sandwiches): return
+                
+                target_sandwich = self.final_sandwiches[pf_index]
+                if not target_sandwich: return
+                
+                chain_str = ",".join(target_sandwich)
+                from chimerax.core.commands import run
+                
+                run(self.session, "~select")
+                run(self.session, f"select #{self.working_model_id}/{chain_str}")
+                
+                self.text_area.append(f"\n>>>> Selected Protofilament with chains: {chain_str}")
+                
+            except Exception as e:
+                QMessageBox.critical(self, "Error", f"Selection failed: {e}")
 
         def action_rename(self):
             if not self.working_file_path: return
@@ -1397,6 +1571,28 @@ def open_chain_modifier():
                     self.text_area.append(f"\nApplied Twist: {applied_twist:.5f}°")
                     self.text_area.append(f"Applied Rise: {applied_rise:.5f} Å")
                     self.text_area.append("Re-evaluated β-sheet")
+                
+                if self.chk_fit_map.isChecked() and getattr(self, 'fit_map_model_id', None) and self.working_model_id:
+                    mode = getattr(self, 'fit_map_mode', 'whole')
+                    self.text_area.append(f"\n>>>> Fitting ({mode}) to Map #{self.fit_map_model_id}...")
+                    from chimerax.core.commands import run
+                    fit_count = 0
+                    try:
+                        if mode == "chain":
+                            for sandwich in self.final_sandwiches:
+                                for chain_id in sandwich:
+                                    run(self.session, f"fitmap #{self.working_model_id}/{chain_id} inMap #{self.fit_map_model_id}")
+                                    fit_count += 1
+                            self.text_area.append(f"Successfully fitted {fit_count} chains to map.")
+                        else:
+                            run(self.session, f"fitmap #{self.working_model_id} inMap #{self.fit_map_model_id}")
+                            self.text_area.append("Successfully fitted the entire model to map.")
+                        
+                        save_format = "mmcif" if self.working_file_path.lower().endswith('.cif') else "pdb"
+                        run(self.session, f'save "{self.working_file_path}" models #{self.working_model_id} format {save_format}')
+                        self.process_pdb(self.working_file_path)
+                    except Exception as e:
+                        self.text_area.append(f"Fit to map warning/error: {e}")
                 
             except Exception as e: 
                 QMessageBox.critical(self, "Error", f"Action failed: {e}")
@@ -2234,7 +2430,7 @@ def open_chain_modifier():
                 if self.final_sandwiches:
                     for i, pf in enumerate(self.final_sandwiches):
                         mid_chain = pf[len(pf)//2] if pf else "?"
-                        self.cmb_protofilaments.addItem(f"PF with Chain {mid_chain}", userData=i)
+                        self.cmb_protofilaments.addItem(f"Protofilament with Chain {mid_chain}", userData=i)
                 self.cmb_protofilaments.blockSignals(False)
 
                 output_lines = []
@@ -3886,14 +4082,59 @@ class PDBModifierTool(ToolInstance):
         
         self.widget.setStyleSheet("""
             QMainWindow, QDialog, QWidget { background-color: #1e1e1e; color: #d4d4d4; font-family: Arial; font-size: 8pt; }
+            
             QPushButton { background-color: #3e3e42; color: #d4d4d4; border: 1px solid #3e3e42; padding: 5px 15px; border-radius: 4px; }
             QPushButton:hover { background-color: #4e4e52; border: 1px solid #98c379; }
             QPushButton:pressed, QPushButton:checked { background-color: #98c379; color: #1e1e1e; border: 1px solid #98c379; }
-            QLineEdit, QSpinBox, QTextEdit, QTextBrowser, QTableWidget { background-color: #3c3c3c; border: 1px solid #3c3c3c; color: #cccccc; padding: 1px;}
+            
+            QLineEdit, QSpinBox, QDoubleSpinBox, QTextEdit, QPlainTextEdit, QTextBrowser, QTableWidget, QComboBox { 
+                background-color: #1e1e1e; border: 1px solid #3e3e42; color: #cccccc; padding: 2px; border-radius: 2px;
+                selection-background-color: #98c379; selection-color: #1e1e1e;
+            }
+            
+            QSpinBox::up-button, QDoubleSpinBox::up-button,
+            QSpinBox::down-button, QDoubleSpinBox::down-button {
+                width: 20px; 
+            }
+
+            QComboBox::drop-down { border: none; }
+            QComboBox QAbstractItemView { 
+                background-color: #252526; color: #d4d4d4; border: 1px solid #3e3e42; outline: none;
+                selection-background-color: #98c379; selection-color: #1e1e1e;
+            }
+            QComboBox QAbstractItemView::item { padding: 2px 5px; min-height: 16px; border: none !important; }
+            QComboBox QAbstractItemView::item:hover,
+            QComboBox QAbstractItemView::item:selected { 
+                background-color: #98c379; color: #1e1e1e; border: none !important; outline: none !important;
+            }
+
+            QTreeWidget, QListWidget, QTreeView { 
+                background-color: #252526; border: 1px solid #3e3e42; color: #cccccc; outline: none; 
+            }
+            QTreeWidget::item, QListWidget::item { padding: 5px; }
+            QTreeWidget::item:selected, QListWidget::item:selected { 
+                background-color: #3e3e42; color: #ffffff; border-left: 3px solid #98c379; 
+            }
+
+            QHeaderView::section { background-color: #252526; color: #98c379; border: 1px solid #3e3e42; padding: 4px; font-weight: bold; }
+            QTableCornerButton::section { background-color: #252526; border: 1px solid #3e3e42; }
+
+            QMenu { background-color: #252526; color: #d4d4d4; border: 1px solid #3e3e42; }
+            QMenu::item:selected { background-color: #3e3e42; color: #98c379; }
+
+            QProgressBar { 
+                border: 1px solid #3e3e42; border-radius: 2px; 
+                background-color: #1e1e1e; text-align: center; color: #d4d4d4; 
+            }
+            QProgressBar::chunk { background-color: #98c379; border-radius: 2px; color: #1e1e1e; }
+
             QGroupBox { border: 1px solid #3e3e42; border-radius: 4px; margin-top: 1.0em; font-weight: bold; color: #98c379; }
             QGroupBox::title { subcontrol-origin: margin; subcontrol-position: top left; padding: 0 5px; }
+            
             QCheckBox::indicator { width: 14px; height: 14px; border: 1px solid #555; border-radius: 2px; background-color: #1e1e1e; }
             QCheckBox::indicator:checked { background-color: #98c379; border: 1px solid #98c379; }
+            QRadioButton::indicator { width: 12px; height: 12px; border: 1px solid #555; border-radius: 7px; background-color: #1e1e1e; }
+            QRadioButton::indicator:checked { background-color: #98c379; border: 1px solid #98c379; }
             
             QSlider:vertical { min-width: 20px; }
             QSlider::groove:vertical { background: #3c3c3c; width: 6px; border-radius: 3px; }
