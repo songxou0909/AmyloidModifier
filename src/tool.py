@@ -1432,6 +1432,15 @@ def open_chain_modifier():
                 self.chk_alt.setToolTip("Expand using a 2-layer step to preserve alternating conformation differences.")
                 layout.addWidget(self.chk_alt)
                 
+                self.chk_compute_axis = QCheckBox("Compute Helical Axis")
+                self.chk_compute_axis.setToolTip(f"Compute the helical axis if selected, otherwise will use the z-axis directly as the helical axis\nIf the tilt is within the maixmum accuracy of the PDB/CIF file, auto-snap to the z-axis depending on how many available decimal digits in the coordinates that your file has")
+                if self.current_layers <= 1:
+                    self.chk_compute_axis.setChecked(False)
+                else:
+                    self.chk_compute_axis.setChecked(True)
+                self.chk_compute_axis.stateChanged.connect(self.on_compute_axis_changed)
+                layout.addWidget(self.chk_compute_axis)
+                
                 form_layout = QFormLayout()
                 self.edit_twist = QLineEdit("0.0")
                 self.edit_rise = QLineEdit("4.8")
@@ -1456,6 +1465,10 @@ def open_chain_modifier():
                     self.chk_alt.setChecked(False)
                     self.chk_alt.setEnabled(False)
                     self.toggle_manual()
+                    
+            def on_compute_axis_changed(self, state):
+                if self.chk_compute_axis.isChecked() and self.current_layers <= 1:
+                    QMessageBox.warning(self, "Reminder", f"Only 1 layer is detected\nChecking this option will force axis computation and may cause false expansion")
                     
             def toggle_manual(self):
                 is_auto = self.chk_auto.isChecked()
@@ -1534,6 +1547,7 @@ def open_chain_modifier():
                     
                     use_auto = dialog.chk_auto.isChecked()
                     use_alt = dialog.chk_alt.isChecked()
+                    use_computed_axis = dialog.chk_compute_axis.isChecked()
                     manual_twist = 0.0
                     manual_rise = 0.0
                     if not use_auto:
@@ -1548,9 +1562,9 @@ def open_chain_modifier():
                     layers_to_add = target_layers - total_layers
                     water_z_limit = self.get_param(self.edit_water_z, 4.0)
                     if self.working_file_path.lower().endswith('.cif'):
-                        applied_twist, applied_rise = self.write_expanded_cif(self.working_file_path, new_temp, layers_to_add, use_auto, manual_twist, manual_rise, water_z_limit, use_alt)
+                        applied_twist, applied_rise, applied_axis, tilt_deg = self.write_expanded_cif(self.working_file_path, new_temp, layers_to_add, use_auto, manual_twist, manual_rise, water_z_limit, use_alt, use_computed_axis)
                     else:
-                        applied_twist, applied_rise = self.write_expanded_pdb(self.working_file_path, new_temp, layers_to_add, use_auto, manual_twist, manual_rise, water_z_limit, use_alt)
+                        applied_twist, applied_rise, applied_axis, tilt_deg = self.write_expanded_pdb(self.working_file_path, new_temp, layers_to_add, use_auto, manual_twist, manual_rise, water_z_limit, use_alt, use_computed_axis)
                     shutil.move(new_temp, self.working_file_path)
                     self.text_area.append(f"\n>>>> Applied Expansion (Added {layers_to_add} layers, Alternating: {use_alt})")
 
@@ -1570,6 +1584,7 @@ def open_chain_modifier():
                 if target_layers > total_layers:
                     self.text_area.append(f"\nApplied Twist: {applied_twist:.5f}°")
                     self.text_area.append(f"Applied Rise: {applied_rise:.5f} Å")
+                    self.text_area.append(f"Applied Axis: [{applied_axis[0]:.4f}, {applied_axis[1]:.4f}, {applied_axis[2]:.4f}], with {tilt_deg:.2f}° tilted from the Z-Axis")
                     self.text_area.append("Re-evaluated β-sheet")
                 
                 if self.chk_fit_map.isChecked() and getattr(self, 'fit_map_model_id', None) and self.working_model_id:
@@ -1617,7 +1632,7 @@ def open_chain_modifier():
             t = centroid_Q - R @ centroid_P
             return R, t
 
-        def write_expanded_pdb(self, input_path, output_path, layers_to_add, use_auto, manual_twist, manual_rise, water_z_limit=4.0, use_alt=False):
+        def write_expanded_pdb(self, input_path, output_path, layers_to_add, use_auto, manual_twist, manual_rise, water_z_limit=4.0, use_alt=False, use_computed_axis=True):
             import numpy as np
             import math
             top_layers_to_add = layers_to_add // 2
@@ -1767,19 +1782,33 @@ def open_chain_modifier():
             
             all_layer_centroids = np.array(all_layer_centroids)
             
-            mean_centroid = np.mean(all_layer_centroids, axis=0)
-            centered_points = all_layer_centroids - mean_centroid
-            
-            _, _, Vt = np.linalg.svd(centered_points)
-            
-            axis_vec = Vt[0]
-            
-            rough_vec = all_layer_centroids[-1] - all_layer_centroids[0]
-            if np.dot(axis_vec, rough_vec) < 0:
-                axis_vec = -axis_vec
+            if use_computed_axis:
+                mean_centroid = np.mean(all_layer_centroids, axis=0)
+                centered_points = all_layer_centroids - mean_centroid
                 
-            axis_len = np.linalg.norm(axis_vec)
-            axis_u = axis_vec / axis_len if axis_len > 0 else np.array([0.0, 0.0, 1.0])
+                _, _, Vt = np.linalg.svd(centered_points)
+                
+                axis_vec = Vt[0]
+                
+                rough_vec = all_layer_centroids[-1] - all_layer_centroids[0]
+                if np.dot(axis_vec, rough_vec) < 0:
+                    axis_vec = -axis_vec
+                    
+                axis_len = np.linalg.norm(axis_vec)
+                axis_u = axis_vec / axis_len if axis_len > 0 else np.array([0.0, 0.0, 1.0])
+            else:
+                axis_u = np.array([0.0, 0.0, 1.0])
+                
+            z_axis = np.array([0.0, 0.0, 1.0])
+            dot_prod = np.clip(np.dot(axis_u, z_axis), -1.0, 1.0)
+            tilt_deg = math.degrees(math.acos(dot_prod))
+            if tilt_deg > 90.0:
+                tilt_deg = 180.0 - tilt_deg
+                
+            # --- SNAP TO Z THRESHOLD (PDB limits to 3 decimal places) ---
+            if tilt_deg < 0.1:
+                axis_u = np.array([0.0, 0.0, 1.0])
+                tilt_deg = 0.0
                 
             z_axis = np.array([0.0, 0.0, 1.0])
             v = np.cross(axis_u, z_axis)
@@ -2065,7 +2094,7 @@ def open_chain_modifier():
                     
                 fout.write("END   \n")
 
-            return reported_twist, reported_rise
+            return reported_twist, reported_rise, axis_u, tilt_deg
 
         def action_restrain(self):
             if not self.final_sandwiches or self.detected_layers == 0: return
@@ -2873,7 +2902,7 @@ def open_chain_modifier():
                     if not in_loop or wrote_headers:
                         fout.write(line)
 
-        def write_expanded_cif(self, input_path, output_path, layers_to_add, use_auto, manual_twist, manual_rise, water_z_limit=4.0, use_alt=False):
+        def write_expanded_cif(self, input_path, output_path, layers_to_add, use_auto, manual_twist, manual_rise, water_z_limit=4.0, use_alt=False, use_computed_axis=True):
             import numpy as np
             import math
             top_layers_to_add = layers_to_add // 2
@@ -3002,19 +3031,48 @@ def open_chain_modifier():
             
             all_layer_centroids = np.array(all_layer_centroids)
             
-            mean_centroid = np.mean(all_layer_centroids, axis=0)
-            centered_points = all_layer_centroids - mean_centroid
-            
-            _, _, Vt = np.linalg.svd(centered_points)
-            
-            axis_vec = Vt[0]
-            
-            rough_vec = all_layer_centroids[-1] - all_layer_centroids[0]
-            if np.dot(axis_vec, rough_vec) < 0:
-                axis_vec = -axis_vec
+            if use_computed_axis:
+                mean_centroid = np.mean(all_layer_centroids, axis=0)
+                centered_points = all_layer_centroids - mean_centroid
                 
-            axis_len = np.linalg.norm(axis_vec)
-            axis_u = axis_vec / axis_len if axis_len > 0 else np.array([0.0, 0.0, 1.0])
+                _, _, Vt = np.linalg.svd(centered_points)
+                
+                axis_vec = Vt[0]
+                
+                rough_vec = all_layer_centroids[-1] - all_layer_centroids[0]
+                if np.dot(axis_vec, rough_vec) < 0:
+                    axis_vec = -axis_vec
+                    
+                axis_len = np.linalg.norm(axis_vec)
+                axis_u = axis_vec / axis_len if axis_len > 0 else np.array([0.0, 0.0, 1.0])
+            else:
+                axis_u = np.array([0.0, 0.0, 1.0])
+                
+            z_axis = np.array([0.0, 0.0, 1.0])
+            dot_prod = np.clip(np.dot(axis_u, z_axis), -1.0, 1.0)
+            tilt_deg = math.degrees(math.acos(dot_prod))
+            if tilt_deg > 90.0:
+                tilt_deg = 180.0 - tilt_deg
+                
+            # --- DYNAMIC SNAP TO Z THRESHOLD FOR CIF ---
+            max_decimals = 3
+            for parts in atom_lines[:100]:
+                try:
+                    x_str = parts[col_x]
+                    if '.' in x_str:
+
+                        dec_len = len(x_str.split('.')[1].rstrip('0'))
+                        if dec_len > max_decimals:
+                            max_decimals = dec_len
+                except Exception:
+                    pass
+                    
+            # Scales threshold: 3 dec = 0.1°, 4 dec = 0.01°, 5 dec = 0.001°, etc.
+            snap_threshold = 0.1 / (10 ** max(0, max_decimals - 3))
+            
+            if tilt_deg < snap_threshold:
+                axis_u = np.array([0.0, 0.0, 1.0])
+                tilt_deg = 0.0
                 
             z_axis = np.array([0.0, 0.0, 1.0])
             v = np.cross(axis_u, z_axis)
@@ -3352,7 +3410,7 @@ def open_chain_modifier():
                 
                 for line in post_lines: fout.write(line)
 
-            return reported_twist, reported_rise
+            return reported_twist, reported_rise, axis_u, tilt_deg
 
         def write_renamed_pdb(self, input_filename, output_filename, sandwiches):
             prot_mapping = self.create_renaming_mapping(sandwiches)
