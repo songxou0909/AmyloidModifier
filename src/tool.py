@@ -705,11 +705,13 @@ def open_chain_modifier():
                 try: coord = np.array([float(p[ix]), float(p[iy]), float(p[iz])])
                 except: continue
                 
+                STANDARD_MODIFIED_RESIDUES = {"MSE", "SEP", "TPO", "PTR", "PCA", "CME", "CSO", "KCX", "ALY", "MLY", "SME", "CSX", "FME", "TYS", "LLP", "SAC"}
+                res_name = p[ir] if ir is not None else ""
+                
                 if ia is not None and p[ia] == "CA":
                     if cid not in chains_c: chains_c[cid]=[]
                     chains_c[cid].append(coord)
-                elif ig is not None and p[ig] == "HETATM":
-                    res_name = p[ir] if ir is not None else ""
+                elif ig is not None and p[ig] == "HETATM" and res_name not in STANDARD_MODIFIED_RESIDUES:
                     atom_name = p[ia] if ia is not None else ""
                     if res_name in ["HOH", "WAT"]:
                         if atom_name.startswith("O"): waters.append(tuple(coord))
@@ -910,6 +912,14 @@ def open_chain_modifier():
             hb_res.addWidget(self.btn_restrain)
             hb_res.addWidget(QLabel("(Export .cxc File)"))
             v_ops.addLayout(hb_res)
+
+            hb_conn = QHBoxLayout()
+            self.btn_connect = QPushButton("Connect Chains")
+            self.btn_connect.setToolTip("This feature helps to merge all chains into one")
+            self.btn_connect.clicked.connect(self.action_connect_chain)
+            hb_conn.addWidget(self.btn_connect)
+            hb_conn.addWidget(QLabel("(Merge all into one chain)"))
+            v_ops.addLayout(hb_conn)
 
             self.grp_ops.setLayout(v_ops)
             layout.addWidget(self.grp_ops)
@@ -2115,6 +2125,189 @@ def open_chain_modifier():
                     self.text_area.append(f"\n[Export] Restrain file generated: {os.path.basename(file_path)}")
                 except Exception as e: QMessageBox.critical(self, "Error", f"Failed to save restrain file:\n{str(e)}")
 
+        def action_connect_chain(self):
+            if not self.working_file_path: return
+            self.sync_viewer_to_file()
+            try:
+                import shutil, shlex, math
+                new_temp = self.working_file_path + ".tmp"
+                is_cif = self.working_file_path.lower().endswith('.cif')
+                
+                target_chain = "A"
+                
+                # --- Step 1: Parse and group by chain, capturing the first coordinate ---
+                pre_lines, headers, atom_lines, post_lines = [], [], [], []
+                header_lines, footer_lines = [], []
+                chain_groups = {}
+                chain_first_coords = {} # cid -> (x, y, z)
+                
+                if is_cif:
+                    in_atom_site = False
+                    with open(self.working_file_path, 'r') as fin:
+                        for line in fin:
+                            s = line.strip()
+                            if s == "loop_":
+                                if in_atom_site:
+                                    in_atom_site = False
+                                    post_lines.append(line)
+                                else:
+                                    pre_lines.append(line)
+                                continue
+                            if s.startswith("_atom_site."):
+                                in_atom_site = True
+                                headers.append(s.split('.')[1])
+                                pre_lines.append(line)
+                                continue
+                            if in_atom_site and s and not s.startswith("_") and not s.startswith("#"):
+                                try: parts = shlex.split(s)
+                                except: parts = s.split()
+                                if len(parts) >= len(headers):
+                                    atom_lines.append((parts, line))
+                                continue
+                            if s.startswith("#") and in_atom_site:
+                                in_atom_site = False
+                                post_lines.append(line)
+                                continue
+                                
+                            if in_atom_site:
+                                post_lines.append(line)
+                                in_atom_site = False
+                            else:
+                                if not headers: pre_lines.append(line)
+                                else: post_lines.append(line)
+                                
+                    col_c = headers.index("auth_asym_id") if "auth_asym_id" in headers else (headers.index("label_asym_id") if "label_asym_id" in headers else -1)
+                    col_x = headers.index("Cartn_x")
+                    col_y = headers.index("Cartn_y")
+                    col_z = headers.index("Cartn_z")
+                    
+                    for parts, line in atom_lines:
+                        if col_c != -1:
+                            chain_id = parts[col_c]
+                            if chain_id not in chain_groups:
+                                chain_groups[chain_id] = []
+                                try: chain_first_coords[chain_id] = (float(parts[col_x]), float(parts[col_y]), float(parts[col_z]))
+                                except: chain_first_coords[chain_id] = (0.0, 0.0, -9999.0)
+                            chain_groups[chain_id].append(parts)
+                else:
+                    with open(self.working_file_path, 'r') as fin:
+                        for line in fin:
+                            if line.startswith("ATOM") or line.startswith("HETATM") or line.startswith("ANISOU"):
+                                if len(line) >= 54:
+                                    chain_id = line[20:22]
+                                    if chain_id not in chain_groups:
+                                        chain_groups[chain_id] = []
+                                        try: chain_first_coords[chain_id] = (float(line[30:38]), float(line[38:46]), float(line[46:54]))
+                                        except: chain_first_coords[chain_id] = (0.0, 0.0, -9999.0)
+                                    chain_groups[chain_id].append(line)
+                            elif line.startswith("TER"):
+                                continue 
+                            elif line.startswith("MASTER") or line.startswith("END") or line.startswith("CONECT"):
+                                footer_lines.append(line)
+                            else:
+                                header_lines.append(line)
+                                
+                # --- Step 2: Smart Sort (Trace protofilaments downwards) ---
+                unvisited = set(chain_groups.keys())
+                sorted_chains = []
+                
+                while unvisited:
+                    # 1. Find the highest Z-coordinate among all remaining chains
+                    top_chain = max(unvisited, key=lambda c: chain_first_coords[c][2])
+                    sorted_chains.append(top_chain)
+                    unvisited.remove(top_chain)
+                    
+                    current_chain = top_chain
+                    # 2. Trace downwards locally (must be within a reasonable X/Y radius to stay in the protofilament)
+                    while True:
+                        cx, cy, cz = chain_first_coords[current_chain]
+                        candidates = []
+                        for nxt in unvisited:
+                            nx, ny, nz = chain_first_coords[nxt]
+                            dz = cz - nz
+                            xy_dist = math.hypot(cx - nx, cy - ny)
+                            # Only consider chains physically below it and close in XY plane
+                            if dz > -2.0 and xy_dist < 25.0:
+                                candidates.append(nxt)
+                        
+                        if not candidates:
+                            break
+                            
+                        # 3. Pick the candidate closest in Z (smallest drop down)
+                        next_chain = min(candidates, key=lambda c: abs(cz - chain_first_coords[c][2]))
+                        sorted_chains.append(next_chain)
+                        unvisited.remove(next_chain)
+                        current_chain = next_chain
+                        
+                # --- Step 3: Rewrite the file with forced Sequence Gaps ---
+                current_new_res = 0
+                
+                with open(new_temp, 'w') as fout:
+                    if is_cif:
+                        for line in pre_lines: fout.write(line)
+                        col_s = headers.index("auth_seq_id") if "auth_seq_id" in headers else (headers.index("label_seq_id") if "label_seq_id" in headers else -1)
+                        
+                        for cid in sorted_chains:
+                            # Skip 1 sequence number entirely to create a gap and force a dotted line
+                            current_new_res += 2
+                            last_seen_res_key = None 
+                            
+                            for parts in chain_groups[cid]:
+                                if col_c != -1 and col_s != -1:
+                                    orig_seq = parts[col_s]
+                                    res_key = (cid, orig_seq)
+                                    
+                                    if res_key != last_seen_res_key:
+                                        if last_seen_res_key is not None:
+                                            current_new_res += 1
+                                        last_seen_res_key = res_key
+                                        
+                                    if "auth_asym_id" in headers: parts[headers.index("auth_asym_id")] = target_chain
+                                    if "label_asym_id" in headers: parts[headers.index("label_asym_id")] = target_chain
+                                    if "auth_seq_id" in headers: parts[headers.index("auth_seq_id")] = str(current_new_res)
+                                    if "label_seq_id" in headers: parts[headers.index("label_seq_id")] = str(current_new_res)
+                                    if "label_entity_id" in headers: parts[headers.index("label_entity_id")] = "1"
+                                    
+                                    formatted_parts = [f"'{p}'" if ' ' in p and not (p.startswith("'") or p.startswith('"')) else p for p in parts]
+                                    fout.write(" ".join(formatted_parts) + "\n")
+                                    
+                        for line in post_lines: fout.write(line)
+                    else:
+                        for line in header_lines: fout.write(line)
+                        
+                        for cid in sorted_chains:
+                            # Skip 1 sequence number entirely to create a gap and force a dotted line
+                            current_new_res += 2
+                            last_seen_res_key = None
+                            
+                            for line in chain_groups[cid]:
+                                orig_seq = line[22:26]
+                                orig_icode = line[26]
+                                res_key = (cid, orig_seq, orig_icode)
+                                
+                                if res_key != last_seen_res_key:
+                                    if last_seen_res_key is not None:
+                                        current_new_res += 1
+                                    last_seen_res_key = res_key
+                                    
+                                l = list(line)
+                                l[21] = target_chain
+                                l[20] = ' '
+                                new_seq_str = f"{current_new_res:>4}"[-4:]
+                                l[22:26] = list(new_seq_str)
+                                fout.write("".join(l))
+                                
+                        for line in footer_lines: fout.write(line)
+
+                shutil.move(new_temp, self.working_file_path)
+                self.text_area.append(f"\n>>>> Chains Connected into Chain {target_chain} (Sorted Top-to-Bottom by Protofilament)")
+                self.reload_working_model()
+                self.process_pdb(self.working_file_path)
+                
+            except Exception as e:
+                from PyQt6.QtWidgets import QMessageBox
+                QMessageBox.critical(self, "Error", f"Action failed: {e}")
+
         def action_evaluate_beta(self):
             if not self.working_file_path or self.detected_layers <= 1: return
             if not self.working_model_id: return
@@ -2574,10 +2767,11 @@ def open_chain_modifier():
                 try: x, y, z = float(parts[i_x]), float(parts[i_y]), float(parts[i_z])
                 except ValueError: continue
                     
-                if group == "ATOM" and ("CA" == atom_name or "CA" in atom_name):
+                STANDARD_MODIFIED_RESIDUES = {"MSE", "SEP", "TPO", "PTR", "PCA", "CME", "CSO", "KCX", "ALY", "MLY", "SME", "CSX", "FME", "TYS", "LLP", "SAC"}
+                if (group == "ATOM" or res_name in STANDARD_MODIFIED_RESIDUES) and ("CA" == atom_name or "CA" in atom_name):
                     if chain_id not in chains: chains[chain_id] = []
                     chains[chain_id].append({'id': res_id, 'coord': np.array([x, y, z])})
-                elif group == "HETATM":
+                elif group == "HETATM" and res_name not in STANDARD_MODIFIED_RESIDUES:
                     if res_name in ["HOH", "WAT"]:
                         if atom_name.startswith("O"): waters.append((x, y, z))
                     else: ions.append((x, y, z))
@@ -2594,12 +2788,13 @@ def open_chain_modifier():
                         try: x, y, z = float(line[30:38]), float(line[38:46]), float(line[46:54])
                         except ValueError: continue
 
+                        STANDARD_MODIFIED_RESIDUES = {"MSE", "SEP", "TPO", "PTR", "PCA", "CME", "CSO", "KCX", "ALY", "MLY", "SME", "CSX", "FME", "TYS", "LLP", "SAC"}
                         if "CA" == atom_name or "CA " in line[12:16]:
                             chain_id = line[20:22].strip()
                             res_id = line[22:27].strip()
                             if chain_id not in chains: chains[chain_id] = []
                             chains[chain_id].append({'id': res_id, 'coord': np.array([x, y, z])})
-                        elif line.startswith("HETATM"):
+                        elif line.startswith("HETATM") and res_name not in STANDARD_MODIFIED_RESIDUES:
                             if res_name in ["HOH", "WAT"]:
                                 if atom_name.startswith("O"): waters.append((x, y, z))
                             else: ions.append((x, y, z))
@@ -2771,10 +2966,10 @@ def open_chain_modifier():
                             for c_idx in chain_cols:
                                 if c_idx < len(parts):
                                     old_val = parts[c_idx]
-                                    if is_hetatm and res_name in het_type_map:
-                                        parts[c_idx] = het_type_map[res_name]
-                                    elif old_val in prot_mapping:
+                                    if old_val in prot_mapping:
                                         parts[c_idx] = prot_mapping[old_val]
+                                    elif is_hetatm and res_name in het_type_map:
+                                        parts[c_idx] = het_type_map[res_name]
                             
                             for i in range(len(parts)):
                                 if ' ' in parts[i] and not (parts[i].startswith("'") or parts[i].startswith('"')):
@@ -3067,7 +3262,7 @@ def open_chain_modifier():
                 except Exception:
                     pass
                     
-            # Scales threshold: 3 dec = 0.1°, 4 dec = 0.01°, 5 dec = 0.001°, etc.
+            # Scales threshold:
             snap_threshold = 0.1 / (10 ** max(0, max_decimals - 3))
             
             if tilt_deg < snap_threshold:
@@ -3435,8 +3630,9 @@ def open_chain_modifier():
                     is_het = (record == "HETATM")
                     is_anisou = (record == "ANISOU")
                     res_name = line[17:20].strip() if len(line) >= 20 else ""
+                    orig_chain = line[20:22].strip() if len(line) >= 22 else ""
 
-                    if (is_het) or (is_anisou and res_name in het_type_map):
+                    if orig_chain not in prot_mapping and ((is_het) or (is_anisou and res_name in het_type_map)):
                         if res_name in het_type_map:
                             new_chain = het_type_map[res_name]
                             current_input_key = line[20:27] 
