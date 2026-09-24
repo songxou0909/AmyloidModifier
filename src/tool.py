@@ -19,10 +19,14 @@ def _structure_dependencies():
     try:
         import gemmi
         import numpy as np
-    except ImportError as exc:
+    except (ImportError, OSError) as exc:
         raise StructureEditError(
-            "Structure export requires Gemmi >= 0.7.4 and NumPy in ChimeraX's "
-            "Python environment. Install the bundle's dependencies before editing."
+            "Amyloid Modifier's structure libraries could not be loaded. "
+            "Install the latest Amyloid Modifier update through Tools > "
+            "More Tools with dependency installation enabled, then restart "
+            "ChimeraX. The installer supplies Gemmi automatically; no commands "
+            "are needed. NumPy is included with ChimeraX.\n\n"
+            f"Details: {exc}"
         ) from exc
     return gemmi, np
 
