@@ -531,9 +531,6 @@ class StructureEditor:
                 residues[_residue_key(r)].append(r)
         owners = {}
         for key, rows in residues.items():
-            if key[0] in core_chains:
-                owners[key] = key[0]
-                continue
             pos = np.mean([[float(r[f]) for f in ("Cartn_x", "Cartn_y", "Cartn_z")] for r in rows], axis=0)
             choices = [(float(np.linalg.norm(pos - cen)), c) for c, cen in centers.items()
                        if abs(float(np.dot(pos - cen, axis))) <= axial_limit]
@@ -541,13 +538,129 @@ class StructureEditor:
                 owners[key] = min(choices)[1]
         return owners
 
-    def trim(self, keep_chains, *, rename=None, keep_residues=()):
+    def covalent_residue_owners(self):
+        # Keep covalently attached nonpolymers with their protein chain.
+        first = [r for r in self.atoms if str(r['pdbx_PDB_model_num']) == self.models[0]]
+        index = _AtomIndex(first)
+        by_id = {r['id']: r for r in first}
+        pairs = [(by_id[a], by_id[b]) for a, b, _ in self.pdb_bonds if a in by_id and b in by_id]
+        for row in _cif_rows(self.block, '_struct_conn.'):
+            if row.get('conn_type_id') in ('covale', 'disulf', 'modres'):
+                pairs.extend((a, b) for a in index.matches(row, 'ptnr1_') for b in index.matches(row, 'ptnr2_'))
+        links, owners = defaultdict(set), defaultdict(set)
+        for a, b in pairs:
+            ka, kb = _residue_key(a), _residue_key(b)
+            pa, pb = a['label_asym_id'] in self.poly_labels, b['label_asym_id'] in self.poly_labels
+            if not pa and not pb:
+                links[ka].add(kb)
+                links[kb].add(ka)
+            elif pa != pb:
+                owners[kb if pa else ka].add(a['auth_asym_id'] if pa else b['auth_asym_id'])
+        pending = list(owners)
+        while pending:
+            key = pending.pop()
+            for other in links[key]:
+                added = owners[key] - owners[other]
+                if added:
+                    owners[other].update(added)
+                    pending.append(other)
+        if any(len(chains) > 1 for chains in owners.values()):
+            raise StructureEditError('A nonpolymer is covalently attached to multiple protein chains; expand the connected assembly explicitly.')
+        return {key: next(iter(chains)) for key, chains in owners.items() if chains}
+
+    def associated_residue_repeats(self, sandwiches, axis, rise, axial_limit=4.0):
+        # Identify ligand sites and their axial occupancy periods.
+        _, np = _structure_dependencies()
+        axis = np.asarray(axis, dtype=float)
+        axis /= np.linalg.norm(axis)
+        rise = abs(float(rise))
+        locations = {c: (pf, i) for pf, stack in enumerate(sandwiches) for i, c in enumerate(stack)}
+        owners = self.associated_residues(set(locations), axial_limit, axis)
+        residues = defaultdict(list)
+        for row in self.atoms:
+            key = _residue_key(row)
+            if key in owners and str(row['pdbx_PDB_model_num']) == self.models[0]:
+                residues[key].append(row)
+        sites = []
+        for key, rows in residues.items():
+            xyz = np.array([[float(r[f]) for f in ('Cartn_x', 'Cartn_y', 'Cartn_z')] for r in rows])
+            center = xyz.mean(0)
+            pf, layer = locations[owners[key]]
+            entry = dict(key=key, layer=layer, center=center,
+                         extent=float(np.ptp(xyz @ axis)), owner=owners[key])
+            identity = (key[-1], frozenset(r['label_atom_id'] for r in rows))
+            site = next((s for s in sites if s['identity'] == identity and s['pf'] == pf and
+                         all(layer != r['layer'] for r in s['residues']) and
+                         any(np.linalg.norm((center - r['center']) - np.dot(center - r['center'], axis) * axis) <= 4.0
+                             for r in s['residues'])), None)
+            if site is None:
+                site = dict(identity=identity, pf=pf, residues=[])
+                sites.append(site)
+            site['residues'].append(entry)
+        for site in sites:
+            members = sorted(site['residues'], key=lambda r: r['layer'])
+            gaps = [b['layer'] - a['layer'] for a, b in zip(members, members[1:])]
+            extent = float(np.median([r['extent'] for r in members]))
+            site['period'] = max(1, min(gaps)) if gaps else (1 if extent < rise else int(math.ceil(extent / rise)) + 1)
+        phases = defaultdict(Counter)
+        for site in sites:
+            period = site['period']
+            if period > 1:
+                for residue in site['residues']:
+                    phases[site['identity'], period][residue['layer'] % period] += 1
+        for site in sites:
+            period = site['period']
+            if period > 1:
+                phase = phases[site['identity'], period].most_common(1)[0][0]
+                for residue in site['residues']:
+                    layer = phase + period * round((residue['layer'] - phase) / period)
+                    residue['layer'] = min(len(sandwiches[0]) - 1, max(0, layer))
+        return sites
+
+    def associated_residues_for_layers(self, sandwiches, keep_indices, axis, axial_limit=4.0):
+        # Keep complete ligand repeats when trimming protein layers.
+        _, np = _structure_dependencies()
+        kept = set(keep_indices)
+        core = {c for s in sandwiches for c in s}
+        kept_chains = {s[i] for s in sandwiches for i in kept if 0 <= i < len(s)}
+        owners = self.associated_residues(core, axial_limit, axis)
+        attached = self.covalent_residue_owners()
+        owners.update(attached)
+        result = {r for r, c in owners.items() if c in kept_chains}
+        if not kept or axis is None or len(sandwiches[0]) < 2:
+            return result
+        ca = self.ca_chains()
+        axis = np.asarray(axis, dtype=float)
+        axis /= np.linalg.norm(axis)
+        centers = [np.mean([r['coord'] for s in sandwiches for r in ca[s[i]]], axis=0)
+                   for i in range(len(sandwiches[0]))]
+        rise = float(np.median(np.abs(np.diff(np.array(centers) @ axis))))
+        if rise < 1e-8:
+            return result
+        sites = self.associated_residue_repeats(sandwiches, axis, rise, axial_limit)
+        midpoint = float(np.mean(sorted(kept)))
+        for site in sites:
+            if site['period'] == 1:
+                continue
+            members = site['residues']
+            result.difference_update(r['key'] for r in members)
+            removed_repeats = len(sandwiches[0]) // site['period'] - len(kept) // site['period']
+            count = max(1, len(members) - removed_repeats)
+            eligible = [r for r in members if min(abs(r['layer'] - i) for i in kept) <= site['period'] / 2]
+            eligible.sort(key=lambda r: (abs(r['layer'] - midpoint), r['layer']))
+            result.update(r['key'] for r in eligible[:count])
+        result.difference_update(attached)
+        result.update(r for r, c in attached.items() if c in kept_chains)
+        return result
+
+    def trim(self, keep_chains, *, rename=None, keep_residues=(), polymer_only=False):
         keep = set(keep_chains)
         unknown = keep - set(self.chains)
         if unknown or not keep:
             raise StructureEditError("Empty selection or unknown chains: " + ", ".join(sorted(unknown)))
         residues = set(keep_residues)
-        rows = [r for r in self.atoms if _null_id(r["auth_asym_id"]) in keep or _residue_key(r) in residues]
+        rows = [r for r in self.atoms if (_null_id(r["auth_asym_id"]) in keep and
+                (not polymer_only or r['label_asym_id'] in self.poly_labels)) or _residue_key(r) in residues]
         mapping = {c: (rename or {}).get(c, c) for c in self.chains if any(_null_id(r["auth_asym_id"]) == c for r in rows)}
         self.report["operation"] = "trim/rename"
         return self.apply_copies([{"chains": mapping, "atom_ids": {r["id"] for r in rows}}])
@@ -1230,6 +1343,11 @@ class StructureEditor:
         made = 0
         all_layers = sorted({layer for pf, layer in instances})
         for a, b, template in templates:
+            if a['label_asym_id'] not in self.poly_labels or b['label_asym_id'] not in self.poly_labels:
+                for group in self.groups:
+                    if (a['id'] in group['ids']) != (b['id'] in group['ids']):
+                        raise StructureEditError('Expansion would split a covalent connection involving a nonpolymer residue.')
+                continue
             if a['auth_asym_id'] not in locations or b['auth_asym_id'] not in locations:
                 continue  # Nonpolymer copies already follow their assigned owner.
             pfa, la = locations[a['auth_asym_id']]
@@ -1632,11 +1750,11 @@ class StructureEditor:
         return self.report
 
 
-def _fit_detection_core(p, q):
-    # Fit a stable 60% core so flexible termini do not dominate the transform.
+def _fit_detection_core(p, q, fraction=.60):
+    # Fit a stable core while allowing long disordered termini.
     import numpy as np
     n = len(p)
-    keep = max(6, int(math.ceil(n * .60)))
+    keep = min(n, max(6, int(math.ceil(n * fraction))))
     seeds = [np.arange(n)]
     seeds.extend(np.arange(i, min(i + 12, n)) for i in range(0, n - 5, 6))
     best = None
@@ -1659,7 +1777,46 @@ def _fit_detection_core(p, q):
             mask = new
         if best is not None and best['rmsd'] < .15:
             break
+    if fraction == .60 and n >= 24 and (best is None or best['rmsd'] > 1.0):
+        smaller = _fit_detection_core(p, q, .25)
+        if smaller is not None and smaller['rmsd'] <= .5:
+            inliers = np.flatnonzero(smaller['error'] <= .75)
+            runs = np.split(inliers, np.where(np.diff(inliers) != 1)[0] + 1)
+            if len(inliers) >= max(12, math.ceil(n * .25)) and max(map(len, runs)) >= 8:
+                refined = _fit_detection_core(p[inliers], q[inliers], 1.)
+                if refined is not None and refined['rmsd'] <= .75:
+                    refined['mask'] = inliers[refined['mask']]
+                    pc, qc = p[refined['mask']].mean(0), q[refined['mask']].mean(0)
+                    refined['error'] = np.linalg.norm((p - pc) @ refined['rotation'].T + qc - q, axis=1)
+                    return refined
     return best
+
+
+def _short_unknown_chain(residues):
+    return 4 <= len(residues) <= 12 and all(tuple(r.get('key', ()))[-1:] == ('UNK',) for r in residues)
+
+
+def _repeat_coordinate_pairs(first, second):
+    # Align short unassigned peptides independently of author residue numbering.
+    import numpy as np
+    a = {r['key']: r['coord'] for r in first}
+    b = {r['key']: r['coord'] for r in second}
+    if set(a) == set(b):
+        return np.array(list(a.values())), np.array([b[k] for k in a])
+    if not (_short_unknown_chain(first) and _short_unknown_chain(second)):
+        raise StructureEditError('C-alpha residue identities differ between equivalent repeat positions; resolve alignment before automatic fitting.')
+    p, q = np.array(list(a.values())), np.array(list(b.values()))
+    choices = []
+    required = max(4, math.ceil(.8 * min(len(p), len(q))))
+    for offset in range(-len(q) + required, len(p) - required + 1):
+        start_p, start_q = max(0, offset), max(0, -offset)
+        size = min(len(p) - start_p, len(q) - start_q)
+        pp, qq = p[start_p:start_p + size], q[start_q:start_q + size]
+        delta = qq - pp
+        score = float(np.mean(np.sum((delta - delta.mean(0)) ** 2, axis=1)) + .01 * np.mean(np.sum(delta ** 2, axis=1)))
+        choices.append((score, -size, start_p, start_q))
+    _, negative_size, i, j = min(choices)
+    return p[i:i - negative_size], q[j:j - negative_size]
 
 
 def _internal_rung_evidence(points, axis, spacing=4.8, max_rungs=6):
@@ -1813,7 +1970,7 @@ def detect_layers(chains, axis_hint=None):
             p = np.array([maps[a][k] for k in common])
             q = np.array([maps[b][k] for k in common])
             lengths = np.linalg.norm(q - p, axis=1)
-            if np.median(lengths) > 36 or np.median(lengths) < 3.5:
+            if np.percentile(lengths, 25) > 36 or np.max(lengths) < 3.5:
                 continue
             fit = _fit_detection_core(p, q)
             if fit is None or fit['rmsd'] > 1.0:
@@ -1893,6 +2050,24 @@ def detect_layers(chains, axis_hint=None):
                     e['contact_pairs'] = [(j, i) for i, j in e['contact_pairs']]
                 edges.append(dict(e, a=a, b=b))
 
+        for i, a in enumerate(ids):
+            for b in ids[i + 1:]:
+                if not (_short_unknown_chain(chains[a]) and _short_unknown_chain(chains[b])):
+                    continue
+                if any({a, b} == {e['a'], e['b']} for e in edges):
+                    continue
+                p, q = _repeat_coordinate_pairs(chains[a], chains[b])
+                delta = q - p
+                vector = delta.mean(0)
+                dz = float(vector @ axis)
+                lateral = float(np.linalg.norm(vector - dz * axis))
+                residual = float(np.sqrt(np.mean(np.sum((delta - vector) ** 2, axis=1))))
+                if not 4.0 <= abs(dz) <= 5.7 or lateral > 2.0 or residual > .9:
+                    continue
+                low, high = (a, b) if dz > 0 else (b, a)
+                edges.append(dict(a=low, b=high, rise=abs(dz), rungs=1, gap=1,
+                                  spacing=abs(dz), rmsd=residual, support=len(p), orientation='parallel'))
+
     # Use the same disjoint paths for grouping and ordering chains.
     up, down, chosen = {}, {}, []
     for e in sorted(edges, key=lambda e: (e['gap'], e['rise'], e['rmsd'] or 0., e['a'], e['b'])):
@@ -1953,7 +2128,7 @@ def detect_layers(chains, axis_hint=None):
     assert sorted(c for t in tracks for c in t['chains']) == ids
     orientations = {t['orientation'] for t in tracks} - {'undetermined'}
     orientation = ('mixed' if len(orientations) > 1 else next(iter(orientations))) if orientations else 'undetermined'
-    return dict(version='3.1', protofilaments=tracks, orientation=orientation,
+    return dict(version='3.2', protofilaments=tracks, orientation=orientation,
                 antiparallel=any(e['orientation'] == 'antiparallel' for e in chosen),
                 sandwiches=[t['chains'] for t in tracks],
                 axis=axis.tolist() if axis is not None else None,
@@ -1981,7 +2156,8 @@ def _expansion_repeat_pattern(chains, sandwiches):
                 if contact is not None:
                     polarity *= -1
                     contact_vectors.append(contact['vector'])
-            identity = frozenset(tuple(r.get('key', (r['id'],))) for r in chains[cid])
+            identity = ('short_unknown_peptide' if _short_unknown_chain(chains[cid]) else
+                        frozenset(tuple(r.get('key', (r['id'],))) for r in chains[cid]))
             stack_tags.append((identity, polarity))
         pure_anti |= bool(flips) and all(flips)
         tags.append(stack_tags)
@@ -2065,13 +2241,11 @@ def expand_structure_layers(editor, sandwiches, layers_to_add, use_auto, manual_
             for i in range(depth - step):
                 a = {r["key"]: r["coord"] for r in ca[s[i]]}
                 b = {r["key"]: r["coord"] for r in ca[s[i + step]]}
-                if set(a) != set(b):
-                    raise StructureEditError("C-alpha residue identities differ between equivalent repeat positions; resolve alignment before automatic fitting.")
-                pair_p, pair_q = np.array(list(a.values())), np.array([b[k] for k in a])
-                pair_ranges.append((len(source), len(source) + len(a)))
+                pair_p, pair_q = _repeat_coordinate_pairs(ca[s[i]], ca[s[i + step]])
+                pair_ranges.append((len(source), len(source) + len(pair_p)))
                 source.extend(pair_p)
                 target.extend(pair_q)
-                if use_computed_axis and (step > 1 or randomize) and len(a) >= 6:
+                if use_computed_axis and (step > 1 or randomize) and len(pair_p) >= 6:
                     fit = _fit_detection_core(pair_p, pair_q)
                     if fit is None or fit['rmsd'] > 1.5:
                         raise StructureEditError('No stable core between equivalent repeat positions.')
@@ -2128,8 +2302,9 @@ def expand_structure_layers(editor, sandwiches, layers_to_add, use_auto, manual_
             errors = np.linalg.norm(full_p @ rotation.T + translation - full_q, axis=1)
             phase_errors = []
             for first, last in pair_ranges:
-                keep = max(3, math.ceil(.6 * (last - first)))
-                core_error = float(np.sqrt(np.mean(np.sort(errors[first:last])[:keep] ** 2)))
+                pair_fit = _fit_detection_core(full_p[first:last], full_q[first:last])
+                mask = pair_fit['mask'] if pair_fit is not None else np.arange(last - first)
+                core_error = float(np.sqrt(np.mean(errors[first:last][mask] ** 2)))
                 phase_errors.append(core_error)
                 if core_error > 1.5:
                     raise StructureEditError('The source units do not share a consistent repeat transform in every phase; choose a different period or manual parameters.')
@@ -2149,7 +2324,11 @@ def expand_structure_layers(editor, sandwiches, layers_to_add, use_auto, manual_
         translation = center - rotation @ center + rise * step * axis
     if abs(rise) < 1e-8:
         raise StructureEditError("Estimated helical rise is zero; refusing overlapping copies.")
-    owners = editor.associated_residues(set(core), water_z_limit, axis)
+    attached_residues = editor.covalent_residue_owners()
+    ligand_sites = editor.associated_residue_repeats(sandwiches, axis, rise, water_z_limit)
+    for site in ligand_sites:
+        site['residues'] = [r for r in site['residues'] if r['key'] not in attached_residues]
+    ligand_sites = [s for s in ligand_sites if s['residues']]
     used = set(editor.chains)
     next_index = 0
     def allocate():
@@ -2184,9 +2363,8 @@ def expand_structure_layers(editor, sandwiches, layers_to_add, use_auto, manual_
                     for stack in sandwiches:
                         if candidate == neighbor:
                             continue
-                        a = {r['key']: r['coord'] for r in ca[stack[candidate]]}
-                        b = {r['key']: r['coord'] for r in ca[stack[neighbor]]}
-                        fit = _fit_detection_core(np.array(list(a.values())), np.array([b[k] for k in a])) if len(a) >= 6 else None
+                        p, q = _repeat_coordinate_pairs(ca[stack[candidate]], ca[stack[neighbor]])
+                        fit = _fit_detection_core(p, q) if len(p) >= 3 else None
                         if fit is None or fit['rmsd'] > 1.0:
                             compatible = False
                             break
@@ -2200,10 +2378,9 @@ def expand_structure_layers(editor, sandwiches, layers_to_add, use_auto, manual_
                 if key not in alignment_cache:
                     donor, reference = [], []
                     for stack in sandwiches:
-                        a = {r['key']: r['coord'] for r in ca[stack[ref]]}
-                        b = {r['key']: r['coord'] for r in ca[stack[anchor]]}
-                        donor.extend(a.values())
-                        reference.extend(b[k] for k in a)
+                        p, q = _repeat_coordinate_pairs(ca[stack[ref]], ca[stack[anchor]])
+                        donor.extend(p)
+                        reference.extend(q)
                     p, q = np.array(donor), np.array(reference)
                     fit = _fit_detection_core(p, q) if len(p) >= 6 else None
                     if fit is None or fit['rmsd'] > 1.5:
@@ -2226,7 +2403,8 @@ def expand_structure_layers(editor, sandwiches, layers_to_add, use_auto, manual_
         homogeneous[:3, :3], homogeneous[:3, 3] = rotation, translation
         transformed = np.linalg.matrix_power(homogeneous, power) @ alignment
         source_chains = {s[ref] for s in sandwiches}
-        selected = [r for r in editor.atoms if _null_id(r["auth_asym_id"]) in source_chains or owners.get(_residue_key(r)) in source_chains]
+        selected = [r for r in editor.atoms if (_null_id(r["auth_asym_id"]) in source_chains and
+                    r['label_asym_id'] in editor.poly_labels) or attached_residues.get(_residue_key(r)) in source_chains]
         chain_order = list(dict.fromkeys(_null_id(r["auth_asym_id"]) for r in selected))
         mapping = {c: allocate() for c in chain_order}
         for pf, strand in enumerate(sandwiches):
@@ -2237,6 +2415,35 @@ def expand_structure_layers(editor, sandwiches, layers_to_add, use_auto, manual_
                                      destination_chains=[instances[pf, dest] for pf in range(len(sandwiches))]))
         copies.append({"chains": mapping, "atom_ids": {r["id"] for r in selected},
                        "matrix": transformed[:3, :3], "vector": transformed[:3, 3]})
+    ligand_copies = []
+    homogeneous = np.eye(4)
+    homogeneous[:3, :3], homogeneous[:3, 3] = rotation, translation
+    for site in ligand_sites:
+        period = site['period']
+        count = (depth + layers_to_add) // period - depth // period
+        candidates = []
+        occupied = {r['layer'] for r in site['residues']}
+        for dest in range(-bottom, depth + top):
+            if dest in occupied:
+                continue
+            donors = [r for r in site['residues'] if (dest - r['layer']) % period == 0 and
+                      (dest - r['layer']) % step == 0]
+            if donors:
+                donor = min(donors, key=lambda r: abs(dest - r['layer']))
+                candidates.append((dest, donor))
+        midpoint = (depth + top - bottom - 1) / 2
+        candidates.sort(key=lambda item: (abs(item[0] - midpoint), item[0]))
+        for dest, donor in candidates[:count]:
+            selected = [r for r in editor.atoms if _residue_key(r) == donor['key']]
+            transformed = np.linalg.matrix_power(homogeneous, (dest - donor['layer']) // step)
+            mapping = {donor['key'][0]: allocate()}
+            copies.append(dict(chains=mapping, atom_ids={r['id'] for r in selected},
+                               matrix=transformed[:3, :3], vector=transformed[:3, 3]))
+            ligand_copies.append(dict(residue=list(donor['key']), source_unit=donor['layer'],
+                                      destination_unit=dest, period_units=period))
+    editor.report['ligand_repeats'] = [dict(component=s['identity'][0], period_units=s['period'],
+                                          source_residues=[list(r['key']) for r in s['residues']]) for s in ligand_sites]
+    editor.report['ligand_copies'] = ligand_copies
     editor.report["operation"] = "expand layers"
     editor.report["geometry"] = {"twist_degrees": twist, "rise_angstrom": rise, "axis": axis.tolist(),
                                  "fit_rmsd_angstrom": rmsd, "alternating": step > 1,
@@ -2354,6 +2561,33 @@ def structure_from_chimerax(session, model):
                                            source_name=f'ChimeraX model #{model.id_string}')
 
 
+def structure_model_format(model):
+    """Use model provenance, not its editable display name, for working format."""
+    source = getattr(model, '_amyloid_structure', None)
+    if isinstance(source, StructureBuffer):
+        return source.format
+    if getattr(model, 'is_mmcif', False):
+        return 'cif'
+    filename = getattr(model, 'filename', None) or getattr(model, 'name', '')
+    return 'cif' if os.path.splitext(filename)[1].lower() in ('.cif', '.mmcif') else 'pdb'
+
+
+def new_source_notices(owner, report):
+    """Display each source issue once per explicit load; keep the full audit."""
+    seen = getattr(owner, '_shown_source_notices', None)
+    if seen is None:
+        owner._shown_source_notices = seen = set()
+    for issue in report.get('source_issues', []):
+        key = (issue['kind'], issue['warning'])
+        if key in seen:
+            continue
+        seen.add(key)
+        message = issue['warning']
+        if issue['kind'] == 'unreviewed_cif_category':
+            message += ' This is an original-source annotation; it can also be carried in a PDB working copy.'
+        yield message
+
+
 def create_structure_working_copy(session, model, path, format):
     source = getattr(model, '_amyloid_structure', None)
     if source is None:
@@ -2454,7 +2688,18 @@ def _attach_preserved_annotations(model, source):
 
 
 def open_structure_buffer(session, source):
+    parse_source = source
     if source.format == 'pdb':
+        editor = StructureEditor(source)
+        if any(len(chain) > 1 for chain in editor.chains):
+            # Native PDB parsing can reinterpret column 21 as a fourth residue
+            # character during later structure processing (TFX/AA -> TFXA/A).
+            # Gemmi already validated extended chain IDs; load those identities
+            # through explicit mmCIF fields while retaining the PDB working copy.
+            editor.rename({})
+            parse_source = StructureBuffer(os.path.splitext(source.name)[0] + '.cif')
+            editor.write(parse_source, format='cif')
+    if parse_source.format == 'pdb':
         from chimerax.pdb import open_pdb
         with StringIO(source.text) as stream:
             models, _ = open_pdb(session, stream, file_name=source.name, log_info=False)
@@ -2464,7 +2709,7 @@ def open_structure_buffer(session, source):
         if not mmcif._initialized:
             mmcif._initialize(session)
         # The native buffer parser requires the final ignore_styling argument.
-        data = source.text.encode('utf-8')
+        data = parse_source.text.encode('utf-8')
         try:
             pointers = _mmcif.parse_mmCIF_buffer(data, mmcif._additional_categories,
                                                 session.logger, False, True, False)
@@ -2495,6 +2740,29 @@ def open_structure_buffer(session, source):
         for model in models:
             model.delete()
         raise
+    return models
+
+
+def replace_structure_buffer(session, source, model_id=None):
+    # Replace a working structure while retaining its ChimeraX model ID.
+    from chimerax.core.models import MODEL_ID_CHANGED
+    previous = next((m for m in session.models.list() if m.id_string == model_id), None)
+    models = open_structure_buffer(session, source)
+    if previous is None:
+        return models
+    replacement = models[0]
+    original_id = previous.id
+    with session.triggers.block_trigger(MODEL_ID_CHANGED):
+        try:
+            session.models.assign_id(previous, session.models.next_id())
+            session.models.assign_id(replacement, original_id)
+        except Exception:
+            session.models.close(models)
+            if not previous.deleted and previous.id != original_id:
+                session.models.assign_id(previous, original_id)
+            raise
+        replacement.name = previous.name
+        session.models.close([previous])
     return models
 
 
@@ -2998,10 +3266,7 @@ def open_chain_modifier():
                 try: run(self.session, "view name chimerax_modifier_locked_view")
                 except: pass
                 
-                models = open_structure_buffer(self.session, self.working_structure)
-                if target_id:
-                    try: run(self.session, f"close #{target_id}")
-                    except: pass
+                models = replace_structure_buffer(self.session, self.working_structure, target_id)
                     
                 if models:
                     first_item = models[0]
@@ -3409,11 +3674,8 @@ def open_chain_modifier():
             if not self.working_structure or not self.final_sandwiches:
                 return set()
             editor = StructureEditor(self.working_structure)
-            core = {c for s in self.final_sandwiches for c in s}
-            kept = {s[i] for s in self.final_sandwiches for i in keep_layer_indices if 0 <= i < len(s)}
             axis = (getattr(self, 'detection_result', None) or {}).get('axis')
-            owners = editor.associated_residues(core, water_z_limit, axis)
-            return {residue for residue, owner in owners.items() if owner in kept}
+            return editor.associated_residues_for_layers(self.final_sandwiches, keep_layer_indices, axis, water_z_limit)
 
 
         def check_live_edits(self):
@@ -3483,10 +3745,11 @@ def open_chain_modifier():
             self._load_in_progress = True
             try:
                 self._axis_reference = None
+                self._shown_source_notices = set()
                 self.original_filename_display = model.name
                 
                 name_part, ext = os.path.splitext(self.original_filename_display)
-                is_cif = ext.lower() in ('.cif', '.mmcif')
+                is_cif = structure_model_format(model) == 'cif'
                 save_ext = ".cif" if is_cif else ".pdb"
                 save_format = "mmcif" if is_cif else "pdb"
                 
@@ -3559,7 +3822,7 @@ def open_chain_modifier():
 
                 # Validate the replacement before closing the current model.
                 try:
-                    models = open_structure_buffer(self.session, self.working_structure)
+                    models = replace_structure_buffer(self.session, self.working_structure, target_id)
                 except Exception as e:
                     self.text_area.append(f"\nModel reload failed; previous model kept: {e}")
                     return False
@@ -3582,11 +3845,6 @@ def open_chain_modifier():
                 new_model_id = first_model.id_string
                 self.working_model_id = new_model_id
                 self._last_live_atom_count = len(first_model.atoms) if hasattr(first_model, 'atoms') else 0
-
-                if target_id and target_id != new_model_id:
-                    try: run(self.session, f"close #{target_id}")
-                    except Exception as e:
-                        self.text_area.append(f"\nPrevious working model could not be closed: {e}")
 
                 try:
                     run(self.session, f"color #{new_model_id} bypolymer")
@@ -4093,8 +4351,8 @@ def open_chain_modifier():
             try:
                 editor = StructureEditor(filename)
                 chains, waters, ions = editor.preview()
-                for issue in editor.report.get('source_issues', []):
-                    self.text_area.append('Warning: ' + escape(issue['warning']))
+                for notice in new_source_notices(self, editor.report):
+                    self.text_area.append('Warning: ' + escape(notice))
                 hint = None
                 reference = getattr(self, '_axis_reference', None)
                 if reference and reference['path'] == filename:
@@ -4132,7 +4390,7 @@ def open_chain_modifier():
                 self.chains_data_plot = {c: [tuple(r['coord']) for r in rows] for c, rows in chains.items()}
                 self.current_waters, self.current_ions = waters, ions
                 self.lbl_orientation.setText(result['orientation'].capitalize())
-                lines = ['--------------- Automatic Detection 3.1 ---------------',
+                lines = ['--------------- Automatic Detection 3.2 ---------------',
                          result['orientation'].capitalize(),
                          f'Total Chains: {len(chains)}',
                          f'Protofilaments: {len(self.final_sandwiches)}',
@@ -4263,7 +4521,7 @@ def open_chain_modifier():
             editor = StructureEditor(input_path)
             # Selections are complete residue identities, never physical text line numbers.
             residues = keep_het_lines or set()
-            editor.trim(keep_chains, keep_residues=residues)
+            editor.trim(keep_chains, keep_residues=residues, polymer_only=True)
             report = editor.write(output_path, format='cif')
             self.text_area.append('Validated trim: {} atoms.'.format(report['atoms']))
 
@@ -4291,7 +4549,7 @@ def open_chain_modifier():
             editor = StructureEditor(input_path)
             # Selections are complete residue identities, never physical text line numbers.
             residues = keep_atom_indices or set()
-            editor.trim(keep_chains, keep_residues=residues)
+            editor.trim(keep_chains, keep_residues=residues, polymer_only=True)
             report = editor.write(output_path, format='pdb')
             self.text_area.append('Validated trim: {} atoms.'.format(report['atoms']))
 
