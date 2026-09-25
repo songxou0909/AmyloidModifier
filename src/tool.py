@@ -140,11 +140,13 @@ class StructureBuffer:
         self.name = os.path.basename(name)
         self.text = text
         self.report = deepcopy(report)
+        self.component_styles = None
         self.format = 'cif' if self.name.lower().endswith(('.cif', '.mmcif')) else 'pdb'
 
     def copy_from(self, other):
         self.text = other.text
         self.report = deepcopy(other.report)
+        self.component_styles = deepcopy(other.component_styles)
         self.format = other.format
 
 
@@ -309,6 +311,16 @@ class StructureEditor:
                             if r.get("entity_id") in {e["entity_id"] for e in _cif_rows(self.block, "_entity_poly.")}}
         if not self.poly_labels:
             self.poly_labels = {r["label_asym_id"] for r in self.atoms if _present(r.get("label_seq_id"))}
+        polymer_types = {e['entity_id']: e.get('type', '') for e in _cif_rows(self.block, '_entity_poly.')}
+        label_types = {r['id']: polymer_types.get(r.get('entity_id'), '')
+                       for r in _cif_rows(self.block, '_struct_asym.')}
+        ca_labels = {r['label_asym_id'] for r in self.atoms
+                     if r['label_atom_id'] == 'CA' and r.get('type_symbol', '').upper() == 'C'}
+        # Polymer metadata also describes RNA/DNA ligands. Keep that metadata,
+        # but only peptide chains belong to the C-alpha protein scaffold.
+        self.protein_labels = {label for label in self.poly_labels
+                               if label_types.get(label, '').startswith('polypeptide') or
+                               (not label_types.get(label) and label in ca_labels)}
         self.pdb_bonds = self._read_conect(st) if not self.is_cif else []
         self._check_source_connections()
         self.groups = []
@@ -493,7 +505,7 @@ class StructureEditor:
         for row in self.atoms:
             if str(row["pdbx_PDB_model_num"]) != self.models[0]:
                 continue
-            if row["label_asym_id"] not in self.poly_labels or row["label_atom_id"] != "CA" or row.get("type_symbol", "C").upper() != "C":
+            if row["label_asym_id"] not in self.protein_labels or row["label_atom_id"] != "CA" or row.get("type_symbol", "C").upper() != "C":
                 continue
             key = _residue_key(row)[1:]
             chain = _null_id(row["auth_asym_id"])
@@ -508,7 +520,7 @@ class StructureEditor:
     def preview(self):
         waters, others = [], []
         for r in self.atoms:
-            if str(r["pdbx_PDB_model_num"]) != self.models[0] or r["label_asym_id"] in self.poly_labels:
+            if str(r["pdbx_PDB_model_num"]) != self.models[0] or r["label_asym_id"] in self.protein_labels:
                 continue
             xyz = tuple(float(r[f]) for f in ("Cartn_x", "Cartn_y", "Cartn_z"))
             if r["label_comp_id"] in ("HOH", "WAT", "DOD"):
@@ -518,24 +530,31 @@ class StructureEditor:
                 others.append(xyz)
         return self.ca_chains(), waters, others
 
+    def companion_groups(self):
+        # A nonprotein polymer is one molecule, not independent nucleotide ligands.
+        groups = defaultdict(list)
+        for row in self.atoms:
+            label = row['label_asym_id']
+            if str(row['pdbx_PDB_model_num']) != self.models[0] or label in self.protein_labels:
+                continue
+            key = ('polymer', label) if label in self.poly_labels else ('residue', _residue_key(row))
+            groups[key].append(row)
+        return list(groups.values())
+
     def associated_residues(self, core_chains, axial_limit=4.0, axis=None):
-        # Assign complete nonpolymer residues once, to the nearest protein chain.
+        # Assign complete companion molecules once, to the nearest protein chain.
         _, np = _structure_dependencies()
         axis = np.asarray(axis if axis is not None else (0, 0, 1), dtype=float)
         axis /= np.linalg.norm(axis)
         ca = self.ca_chains()
         centers = {c: np.mean([r["coord"] for r in ca[c]], axis=0) for c in core_chains if c in ca}
-        residues = defaultdict(list)
-        for r in self.atoms:
-            if str(r["pdbx_PDB_model_num"]) == self.models[0] and r["label_asym_id"] not in self.poly_labels:
-                residues[_residue_key(r)].append(r)
         owners = {}
-        for key, rows in residues.items():
+        for rows in self.companion_groups():
             pos = np.mean([[float(r[f]) for f in ("Cartn_x", "Cartn_y", "Cartn_z")] for r in rows], axis=0)
             choices = [(float(np.linalg.norm(pos - cen)), c) for c, cen in centers.items()
                        if abs(float(np.dot(pos - cen, axis))) <= axial_limit]
             if choices:
-                owners[key] = min(choices)[1]
+                owners.update((_residue_key(r), min(choices)[1]) for r in rows)
         return owners
 
     def covalent_residue_owners(self):
@@ -550,12 +569,17 @@ class StructureEditor:
         links, owners = defaultdict(set), defaultdict(set)
         for a, b in pairs:
             ka, kb = _residue_key(a), _residue_key(b)
-            pa, pb = a['label_asym_id'] in self.poly_labels, b['label_asym_id'] in self.poly_labels
+            pa, pb = a['label_asym_id'] in self.protein_labels, b['label_asym_id'] in self.protein_labels
             if not pa and not pb:
                 links[ka].add(kb)
                 links[kb].add(ka)
             elif pa != pb:
                 owners[kb if pa else ka].add(a['auth_asym_id'] if pa else b['auth_asym_id'])
+        for rows in self.companion_groups():
+            keys = list(dict.fromkeys(_residue_key(r) for r in rows))
+            for a, b in zip(keys, keys[1:]):
+                links[a].add(b)
+                links[b].add(a)
         pending = list(owners)
         while pending:
             key = pending.pop()
@@ -576,19 +600,27 @@ class StructureEditor:
         rise = abs(float(rise))
         locations = {c: (pf, i) for pf, stack in enumerate(sandwiches) for i, c in enumerate(stack)}
         owners = self.associated_residues(set(locations), axial_limit, axis)
-        residues = defaultdict(list)
-        for row in self.atoms:
-            key = _residue_key(row)
-            if key in owners and str(row['pdbx_PDB_model_num']) == self.models[0]:
-                residues[key].append(row)
         sites = []
-        for key, rows in residues.items():
+        for rows in self.companion_groups():
+            keys = tuple(dict.fromkeys(_residue_key(r) for r in rows))
+            key = keys[0]
+            if key not in owners:
+                continue
             xyz = np.array([[float(r[f]) for f in ('Cartn_x', 'Cartn_y', 'Cartn_z')] for r in rows])
             center = xyz.mean(0)
             pf, layer = locations[owners[key]]
-            entry = dict(key=key, layer=layer, center=center,
+            entry = dict(key=key, keys=keys, layer=layer, center=center,
                          extent=float(np.ptp(xyz @ axis)), owner=owners[key])
-            identity = (key[-1], frozenset(r['label_atom_id'] for r in rows))
+            identity = ('+'.join(k[-1] for k in keys),
+                        frozenset((keys.index(_residue_key(r)), r['label_atom_id']) for r in rows))
+            if len(keys) > 1:
+                # An axial oligonucleotide occupies one repeat per nucleotide.
+                # Atomic extent includes terminal base/ribose overhangs, so use
+                # successive residue centers to estimate its whole-chain period.
+                projections = np.array([xyz[[_residue_key(r) == k for r in rows]].mean(0) @ axis for k in keys])
+                spacing = np.abs(np.diff(projections))
+                if np.all((spacing > .5 * rise) & (spacing < 1.5 * rise)):
+                    entry['polymer_period'] = max(1, int(round((np.ptp(projections) + np.median(spacing)) / rise)))
             site = next((s for s in sites if s['identity'] == identity and s['pf'] == pf and
                          all(layer != r['layer'] for r in s['residues']) and
                          any(np.linalg.norm((center - r['center']) - np.dot(center - r['center'], axis) * axis) <= 4.0
@@ -601,7 +633,14 @@ class StructureEditor:
             members = sorted(site['residues'], key=lambda r: r['layer'])
             gaps = [b['layer'] - a['layer'] for a, b in zip(members, members[1:])]
             extent = float(np.median([r['extent'] for r in members]))
-            site['period'] = max(1, min(gaps)) if gaps else (1 if extent < rise else int(math.ceil(extent / rise)) + 1)
+            inferred = members[0].get('polymer_period', 1 if extent < rise else int(math.ceil(extent / rise)) + 1)
+            if gaps and all('polymer_period' in r for r in members):
+                # After trimming, a terminal RNA can extend beyond the protein
+                # bounds; its nearest remaining owner is shifted inward. Measure
+                # the actual repeat separation rather than that clipped index.
+                positions = sorted(float(r['center'] @ axis) for r in members)
+                gaps = [max(1, int(round((b - a) / rise))) for a, b in zip(positions, positions[1:])]
+            site['period'] = max(1, min(gaps)) if gaps else inferred
         phases = defaultdict(Counter)
         for site in sites:
             period = site['period']
@@ -643,12 +682,12 @@ class StructureEditor:
             if site['period'] == 1:
                 continue
             members = site['residues']
-            result.difference_update(r['key'] for r in members)
+            result.difference_update(k for r in members for k in r['keys'])
             removed_repeats = len(sandwiches[0]) // site['period'] - len(kept) // site['period']
             count = max(1, len(members) - removed_repeats)
             eligible = [r for r in members if min(abs(r['layer'] - i) for i in kept) <= site['period'] / 2]
             eligible.sort(key=lambda r: (abs(r['layer'] - midpoint), r['layer']))
-            result.update(r['key'] for r in eligible[:count])
+            result.update(k for r in eligible[:count] for k in r['keys'])
         result.difference_update(attached)
         result.update(r for r, c in attached.items() if c in kept_chains)
         return result
@@ -660,7 +699,7 @@ class StructureEditor:
             raise StructureEditError("Empty selection or unknown chains: " + ", ".join(sorted(unknown)))
         residues = set(keep_residues)
         rows = [r for r in self.atoms if (_null_id(r["auth_asym_id"]) in keep and
-                (not polymer_only or r['label_asym_id'] in self.poly_labels)) or _residue_key(r) in residues]
+                (not polymer_only or r['label_asym_id'] in self.protein_labels)) or _residue_key(r) in residues]
         mapping = {c: (rename or {}).get(c, c) for c in self.chains if any(_null_id(r["auth_asym_id"]) == c for r in rows)}
         self.report["operation"] = "trim/rename"
         return self.apply_copies([{"chains": mapping, "atom_ids": {r["id"] for r in rows}}])
@@ -1343,7 +1382,7 @@ class StructureEditor:
         made = 0
         all_layers = sorted({layer for pf, layer in instances})
         for a, b, template in templates:
-            if a['label_asym_id'] not in self.poly_labels or b['label_asym_id'] not in self.poly_labels:
+            if a['label_asym_id'] not in self.protein_labels or b['label_asym_id'] not in self.protein_labels:
                 for group in self.groups:
                     if (a['id'] in group['ids']) != (b['id'] in group['ids']):
                         raise StructureEditError('Expansion would split a covalent connection involving a nonpolymer residue.')
@@ -2327,7 +2366,7 @@ def expand_structure_layers(editor, sandwiches, layers_to_add, use_auto, manual_
     attached_residues = editor.covalent_residue_owners()
     ligand_sites = editor.associated_residue_repeats(sandwiches, axis, rise, water_z_limit)
     for site in ligand_sites:
-        site['residues'] = [r for r in site['residues'] if r['key'] not in attached_residues]
+        site['residues'] = [r for r in site['residues'] if not any(k in attached_residues for k in r['keys'])]
     ligand_sites = [s for s in ligand_sites if s['residues']]
     used = set(editor.chains)
     next_index = 0
@@ -2404,7 +2443,7 @@ def expand_structure_layers(editor, sandwiches, layers_to_add, use_auto, manual_
         transformed = np.linalg.matrix_power(homogeneous, power) @ alignment
         source_chains = {s[ref] for s in sandwiches}
         selected = [r for r in editor.atoms if (_null_id(r["auth_asym_id"]) in source_chains and
-                    r['label_asym_id'] in editor.poly_labels) or attached_residues.get(_residue_key(r)) in source_chains]
+                    r['label_asym_id'] in editor.protein_labels) or attached_residues.get(_residue_key(r)) in source_chains]
         chain_order = list(dict.fromkeys(_null_id(r["auth_asym_id"]) for r in selected))
         mapping = {c: allocate() for c in chain_order}
         for pf, strand in enumerate(sandwiches):
@@ -2434,7 +2473,7 @@ def expand_structure_layers(editor, sandwiches, layers_to_add, use_auto, manual_
         midpoint = (depth + top - bottom - 1) / 2
         candidates.sort(key=lambda item: (abs(item[0] - midpoint), item[0]))
         for dest, donor in candidates[:count]:
-            selected = [r for r in editor.atoms if _residue_key(r) == donor['key']]
+            selected = [r for r in editor.atoms if _residue_key(r) in donor['keys']]
             transformed = np.linalg.matrix_power(homogeneous, (dest - donor['layer']) // step)
             mapping = {donor['key'][0]: allocate()}
             copies.append(dict(chains=mapping, atom_ids={r['id'] for r in selected},
@@ -2610,6 +2649,8 @@ def create_structure_working_copy(session, model, path, format):
         editor.rename({})
         editor.report['warnings'].append('No accessible original source; metadata already discarded by ChimeraX cannot be recovered.')
         report = editor.write(path, format='cif' if format == 'mmcif' else 'pdb')
+    if isinstance(path, StructureBuffer):
+        path.component_styles = capture_component_styles(model)
     for issue in report.get('source_issues', []):
         session.logger.warning(issue['warning'])
     return report
@@ -2692,10 +2733,8 @@ def open_structure_buffer(session, source):
     if source.format == 'pdb':
         editor = StructureEditor(source)
         if any(len(chain) > 1 for chain in editor.chains):
-            # Native PDB parsing can reinterpret column 21 as a fourth residue
-            # character during later structure processing (TFX/AA -> TFXA/A).
-            # Gemmi already validated extended chain IDs; load those identities
-            # through explicit mmCIF fields while retaining the PDB working copy.
+            # Native PDB parsing can reinterpret column 21 as a fourth residue character during later structure processing (TFX/AA -> TFXA/A).
+            # Gemmi already validated extended chain IDs; load those identities through explicit mmCIF fields while retaining the PDB working copy.
             editor.rename({})
             parse_source = StructureBuffer(os.path.splitext(source.name)[0] + '.cif')
             editor.write(parse_source, format='cif')
@@ -2736,6 +2775,9 @@ def open_structure_buffer(session, source):
             model._amyloid_structure = StructureBuffer(source.name, source.text, source.report)
             _attach_preserved_annotations(model, source)
         session.models.add(models)
+        if source.component_styles:
+            for model in models:
+                restore_component_styles(model, source.component_styles, source.report)
     except Exception:
         for model in models:
             model.delete()
@@ -2743,14 +2785,73 @@ def open_structure_buffer(session, source):
     return models
 
 
+def _display_components(model):
+    # Native collection operations: one state per chain/polymer or ligand type, with no Python atom-by-atom identity or rendering-state map.
+    import numpy as np
+    for _, chain, atoms in model.atoms.by_chain:
+        types = atoms.residues.polymer_types
+        names = atoms.residues.names
+        for polymer_type in np.unique(types):
+            mask = types == polymer_type
+            if polymer_type:
+                yield (chain, int(polymer_type), ''), atoms.filter(mask)
+            else:
+                for name in np.unique(names[mask]):
+                    yield (chain, 0, str(name)), atoms.filter(mask & (names == name))
+
+
+def capture_component_styles(model):
+    import numpy as np
+    def dominant(values):
+        values, counts = np.unique(values, axis=0, return_counts=True)
+        return values[np.argmax(counts)].tolist()
+    styles = {}
+    for key, atoms in _display_components(model):
+        visible = atoms.displays
+        residues = atoms.unique_residues
+        elements = atoms.element_numbers
+        colors = atoms.colors
+        styles[key] = dict(draw_mode=dominant(atoms.draw_modes[visible] if np.any(visible) else atoms.draw_modes),
+                           atoms=bool(np.any(visible)), cartoons=bool(np.any(residues.ribbon_displays)),
+                           ribbon_color=dominant(residues.ribbon_colors),
+                           colors={int(element): dominant(colors[elements == element]) for element in np.unique(elements)})
+    return styles
+
+
+def restore_component_styles(model, styles, report=None):
+    # Each new chain inherits from the actual expansion/rename donor, so distinct protofilament styles remain distinct even when chain IDs change on trimming.
+    origins = {new: old for group in (report or {}).get('chain_copies', [])
+               for old, new in group['author_chains'].items()}
+    for (chain, polymer_type, component), atoms in _display_components(model):
+        key = (origins.get(chain, chain), polymer_type, component)
+        state = styles.get(key)
+        if state is None:
+            continue
+        atoms.draw_modes = state['draw_mode']
+        atoms.displays = state['atoms']
+        residues = atoms.unique_residues
+        residues.ribbon_displays = state['cartoons']
+        residues.ribbon_colors = state['ribbon_color']
+        elements = atoms.element_numbers
+        for element, color in state['colors'].items():
+            atoms.filter(elements == element).colors = color
+
+
 def replace_structure_buffer(session, source, model_id=None):
     # Replace a working structure while retaining its ChimeraX model ID.
     from chimerax.core.models import MODEL_ID_CHANGED
     previous = next((m for m in session.models.list() if m.id_string == model_id), None)
+    styles = capture_component_styles(previous) if previous is not None else None
     models = open_structure_buffer(session, source)
     if previous is None:
         return models
     replacement = models[0]
+    try:
+        restore_component_styles(replacement, styles, source.report)
+        replacement.display = previous.display
+    except Exception:
+        session.models.close(models)
+        raise
     original_id = previous.id
     with session.triggers.block_trigger(MODEL_ID_CHANGED):
         try:
@@ -3233,33 +3334,6 @@ def open_chain_modifier():
         def reload_working_model(self):
             target_id = getattr(self, 'working_model_id', None)
             
-            captured_state = False
-            was_cartoon_visible = False
-            was_atom_visible = True
-            atom_style = None
-            
-            try:
-                from chimerax.atomic import AtomicStructure
-                for m in self.session.models.list(type=AtomicStructure):
-                    if m.id_string == target_id:
-                        captured_state = True
-                        if hasattr(m, 'residues') and len(m.residues) > 0:
-                            was_cartoon_visible = any(getattr(r, 'ribbon_display', False) for r in m.residues)
-                        if hasattr(m, 'atoms') and len(m.atoms) > 0:
-                            was_atom_visible = any(getattr(a, 'display', True) for a in m.atoms)
-                            for a in m.atoms:
-                                if getattr(a, 'display', False):
-                                    mode_val = getattr(a, 'draw_mode', 2)
-                                    mode_str = str(mode_val).lower()
-                                    if mode_val == 0 or "sphere" in mode_str: atom_style = "sphere"
-                                    elif mode_val == 1 or "ball" in mode_str: atom_style = "ball"
-                                    elif mode_val == 3 or "wire" in mode_str: atom_style = "wire"
-                                    else: atom_style = "stick"
-                                    break
-                        break
-            except Exception:
-                pass
-            
             try:
                 from chimerax.core.commands import run
                 
@@ -3274,17 +3348,6 @@ def open_chain_modifier():
                     if hasattr(first_model, 'id_string'):
                         self.working_model_id = first_model.id_string
                         self._last_live_atom_count = len(first_model.atoms) if hasattr(first_model, 'atoms') else 0
-                        run(self.session, f"color #{self.working_model_id} bypolymer")
-                        
-                        if captured_state:
-                            if was_cartoon_visible: run(self.session, f"show #{self.working_model_id} cartoons")
-                            else: run(self.session, f"hide #{self.working_model_id} cartoons")
-                            
-                            if was_atom_visible:
-                                run(self.session, f"show #{self.working_model_id} atoms")
-                                if atom_style: run(self.session, f"style #{self.working_model_id} {atom_style}")
-                            else: run(self.session, f"hide #{self.working_model_id} atoms")
-                
                 try: run(self.session, "view chimerax_modifier_locked_view")
                 except: pass
                 
@@ -3785,33 +3848,6 @@ def open_chain_modifier():
 
             target_id = self.working_model_id
             
-            captured_state = False
-            was_cartoon_visible = False
-            was_atom_visible = True
-            atom_style = None
-            
-            try:
-                from chimerax.atomic import AtomicStructure
-                for m in self.session.models.list(type=AtomicStructure):
-                    if m.id_string == target_id:
-                        captured_state = True
-                        if hasattr(m, 'residues') and len(m.residues) > 0:
-                            was_cartoon_visible = any(getattr(r, 'ribbon_display', False) for r in m.residues)
-                        if hasattr(m, 'atoms') and len(m.atoms) > 0:
-                            was_atom_visible = any(getattr(a, 'display', True) for a in m.atoms)
-                            for a in m.atoms:
-                                if getattr(a, 'display', False):
-                                    mode_val = getattr(a, 'draw_mode', 2)
-                                    mode_str = str(mode_val).lower()
-                                    if mode_val == 0 or "sphere" in mode_str: atom_style = "sphere"
-                                    elif mode_val == 1 or "ball" in mode_str: atom_style = "ball"
-                                    elif mode_val == 3 or "wire" in mode_str: atom_style = "wire"
-                                    else: atom_style = "stick"
-                                    break
-                        break
-            except Exception:
-                pass
-            
             from chimerax.core.commands import run
             from chimerax.atomic import AtomicStructure
 
@@ -3845,20 +3881,6 @@ def open_chain_modifier():
                 new_model_id = first_model.id_string
                 self.working_model_id = new_model_id
                 self._last_live_atom_count = len(first_model.atoms) if hasattr(first_model, 'atoms') else 0
-
-                try:
-                    run(self.session, f"color #{new_model_id} bypolymer")
-
-                    if captured_state:
-                        if was_cartoon_visible: run(self.session, f"show #{new_model_id} cartoons")
-                        else: run(self.session, f"hide #{new_model_id} cartoons")
-
-                        if was_atom_visible:
-                            run(self.session, f"show #{new_model_id} atoms")
-                            if atom_style: run(self.session, f"style #{new_model_id} {atom_style}")
-                        else: run(self.session, f"hide #{new_model_id} atoms")
-                except Exception as e:
-                    self.text_area.append(f"\nModel display warning: {e}")
 
                 return True
             finally:
