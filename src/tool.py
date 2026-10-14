@@ -3806,7 +3806,8 @@ try:
                                  QVBoxLayout, QHBoxLayout, QSizePolicy, QSlider,
                                  QSplitter, QSpinBox, QGroupBox, QFormLayout,
                                  QCheckBox, QTableWidget, QHeaderView, QTableWidgetItem,
-                                 QTextBrowser, QDialog, QComboBox, QTabWidget, QButtonGroup, QFrame)
+                                 QTextBrowser, QDialog, QComboBox, QTabWidget, QButtonGroup, QFrame,
+                                 QScrollArea, QLayout)
     from PyQt6.QtCore import Qt, QTimer
     from chimerax.core.tools import ToolInstance
     from chimerax.core.commands import run
@@ -3829,8 +3830,10 @@ def open_chain_modifier():
         import numpy as np
         import matplotlib
         matplotlib.use('qtagg')
-        from PyQt6.QtGui import QDoubleValidator, QIntValidator, QIcon, QColor, QPainter, QPainterPath, QPen, QPixmap
-        from PyQt6.QtCore import QRectF, QSize
+        from PyQt6.QtGui import (QDoubleValidator, QIntValidator, QIcon, QColor, QPainter,
+                                 QPainterPath, QPen, QPixmap, QImage, QLinearGradient,
+                                 QRegularExpressionValidator, QWheelEvent)
+        from PyQt6.QtCore import QRectF, QSize, QPointF, QEvent, QRegularExpression, pyqtSignal
         from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
         from matplotlib.figure import Figure
     except ImportError as e:
@@ -5646,13 +5649,494 @@ def open_chain_modifier():
                 except Exception as e:
                     QMessageBox.critical(self, "Error", f"Failed to export raw file:\n{e}")
 
+    # Screen-RGB palettes inspired by contemporary peach, mocha, lavender and
+    # aqua trends; these are original combinations, not certified Pantone matches.
+    # Inspiration: https://www.pantone.com/na/en-us/color-of-the-year/2024
+    # https://connect.pantone.com/color-insider/the-story-of-color-of-the-year-2025
+    # https://www.pantone.com/articles/color-palettes/new-pantone-pms-colors-2026-color-palettes
+    LOCALRES_PRESETS = (
+        ('Classic', ('#FF0000', '#FFFFFF', '#0000FF')),
+        ('Peach & Teal', ('#F4B49A', '#F4E8D7', '#247C83')),
+        ('Mocha & Mist', ('#795548', '#C4A48D', '#EEE7DF')),
+        ('Digital Lavender', ('#524A83', '#B2A0D4', '#ECE3F3')),
+        ('Lagoon', ('#174F63', '#45AAA6', '#D9EFCE')),
+        ('Rose & Sage', ('#BA647D', '#F0DDD5', '#6C937D')),
+        ('Apricot Dusk', ('#F4BF82', '#D77E8C', '#665581')),
+        ('Berry & Cloud', ('#922F55', '#D993AC', '#F4E9E9')),
+        ('Cobalt & Sand', ('#365F9F', '#D7E1E8', '#DDB986')),
+        ('Pistachio', ('#426F62', '#A8BC7D', '#EEE9BF')),
+        ('Coral & Ink', ('#EE8C7D', '#344C6A')),
+        ('Indigo & Citrus', ('#382078', '#E8D5F0', '#F5CC32')),
+        ('Ocean & Ember', ('#075A91', '#F1E5CD', '#E65C26')),
+        ('Plum & Mint', ('#781C61', '#EBDCE8', '#35C6A0')),
+    )
+
+    def scroll_control_panel(widget, event):
+        """Forward wheel/trackpad deltas to the nearest enclosing scroll area."""
+        parent = widget.parentWidget()
+        while parent is not None and not isinstance(parent, QScrollArea):
+            parent = parent.parentWidget()
+        if parent is None:
+            event.ignore()
+            return
+        viewport = parent.viewport()
+        forwarded = QWheelEvent(QPointF(viewport.mapFromGlobal(event.globalPosition().toPoint())),
+                                event.globalPosition(), event.pixelDelta(), event.angleDelta(),
+                                event.buttons(), event.modifiers(), event.phase(), event.inverted())
+        QApplication.sendEvent(viewport, forwarded)
+        event.accept()
+
+    class PanelComboBox(QComboBox):
+        def wheelEvent(self, event):
+            # Let the enclosing scroll area handle the wheel. The popup list
+            # keeps its own wheel handling when deliberately opened.
+            scroll_control_panel(self, event)
+
+    class PanelSlider(QSlider):
+        def wheelEvent(self, event):
+            scroll_control_panel(self, event)
+
+    class PanelSpinBox(QSpinBox):
+        def wheelEvent(self, event):
+            scroll_control_panel(self, event)
+
+    def sample_ramp(colors, count):
+        """Sample equally spaced RGB anchors, retaining both exact endpoints."""
+        rgb = np.array([QColor(c).getRgb()[:3] for c in colors], dtype=float)
+        positions = np.linspace(0.0, 1.0, count)
+        anchors = np.linspace(0.0, 1.0, len(rgb))
+        sampled = np.rint(np.column_stack([
+            np.interp(positions, anchors, rgb[:, channel]) for channel in range(3)
+        ])).astype(int)
+        return [QColor(*map(int, row)).name() for row in sampled]
+
+    class ResolutionRamp(QWidget):
+        """Selectable, fixed-position stops. Dragging never moves a stop."""
+        selected = pyqtSignal(int)
+
+        def __init__(self, parent=None):
+            super().__init__(parent)
+            self.colors = ['#ff0000', '#ffffff', '#0000ff']
+            self.selected_index = -1
+            self.setMinimumWidth(240)
+            self.setFixedHeight(52)
+            self.setToolTip('Click a stop to edit its colour. Stops are always evenly spaced.')
+
+        def stop_rect(self, index):
+            x = 12 + index * (self.width() - 24) / (len(self.colors) - 1)
+            return QRectF(x - 7, 29, 14, 19)
+
+        def paintEvent(self, event):
+            painter = QPainter(self)
+            painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+            gradient = QLinearGradient(12, 0, self.width() - 12, 0)
+            for i, color in enumerate(self.colors):
+                gradient.setColorAt(i / (len(self.colors) - 1), QColor(color))
+            painter.setPen(QPen(QColor('#555555'), 1))
+            painter.setBrush(gradient)
+            painter.drawRoundedRect(QRectF(12, 5, self.width() - 24, 25), 3, 3)
+            for i, color in enumerate(self.colors):
+                rect = self.stop_rect(i)
+                path = QPainterPath()
+                path.moveTo(rect.center().x(), rect.top())
+                path.lineTo(rect.right(), rect.top() + 6)
+                path.lineTo(rect.right(), rect.bottom())
+                path.lineTo(rect.left(), rect.bottom())
+                path.lineTo(rect.left(), rect.top() + 6)
+                path.closeSubpath()
+                painter.setBrush(QColor(color))
+                # Dark under-stroke keeps a pale stop visible on a pale gradient.
+                painter.setPen(QPen(QColor('#111111'), 4))
+                painter.drawPath(path)
+                painter.setPen(QPen(QColor('#98c379' if i == self.selected_index else '#8a8a8a'),
+                                    2.5 if i == self.selected_index else 1))
+                painter.drawPath(path)
+
+        def mousePressEvent(self, event):
+            if event.button() != Qt.MouseButton.LeftButton:
+                return
+            index = next((i for i in range(len(self.colors))
+                          if self.stop_rect(i).adjusted(-3, -3, 3, 3).contains(event.position())), -1)
+            self.selected.emit(index)
+
+    class HueSaturationWheel(QWidget):
+        changed = pyqtSignal(float, float)
+
+        def __init__(self, parent=None):
+            super().__init__(parent)
+            self.hue, self.saturation = 0.0, 0.0
+            self._dragging = False
+            self.setFixedSize(192, 192)
+            self.setCursor(Qt.CursorShape.CrossCursor)
+            self.setToolTip('Hue around the circle; saturation from centre to edge')
+            # Cache the wheel once; moving its selector only repaints the marker.
+            from matplotlib.colors import hsv_to_rgb
+            scale = self.devicePixelRatioF()
+            pixels = round(192 * scale)
+            yy, xx = np.mgrid[0:pixels, 0:pixels]
+            dx, dy = ((xx + 0.5) / scale - 96) / 94, (96 - (yy + 0.5) / scale) / 94
+            saturation = np.sqrt(dx * dx + dy * dy)
+            hue = np.mod(np.arctan2(dy, dx) / (2 * np.pi), 1.0)
+            rgb = hsv_to_rgb(np.stack((hue, np.clip(saturation, 0, 1), np.ones_like(hue)), axis=-1))
+            rgba = np.empty((pixels, pixels, 4), dtype=np.uint8)
+            rgba[:, :, :3] = np.rint(rgb * 255).astype(np.uint8)
+            rgba[:, :, 3] = np.rint(np.clip((1 - saturation) * 94 * scale, 0, 1) * 255).astype(np.uint8)
+            self._image = QImage(rgba.data, pixels, pixels, rgba.strides[0], QImage.Format.Format_RGBA8888).copy()
+            self._image.setDevicePixelRatio(scale)
+
+        def paintEvent(self, event):
+            painter = QPainter(self)
+            painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+            painter.drawImage(0, 0, self._image)
+            angle = self.hue * 2 * np.pi
+            centre = QPointF(95.5 + 94 * self.saturation * np.cos(angle),
+                             95.5 - 94 * self.saturation * np.sin(angle))
+            painter.setBrush(Qt.BrushStyle.NoBrush)
+            painter.setPen(QPen(QColor('#1e1e1e'), 3))
+            painter.drawEllipse(centre, 5, 5)
+            painter.setPen(QPen(QColor('#ffffff'), 1))
+            painter.drawEllipse(centre, 5, 5)
+
+        def _pick(self, position):
+            dx, dy = position.x() - 95.5, 95.5 - position.y()
+            self.hue = float(np.arctan2(dy, dx) / (2 * np.pi) % 1.0)
+            self.saturation = float(min(1.0, np.hypot(dx, dy) / 94))
+            self.update()
+            self.changed.emit(self.hue, self.saturation)
+
+        def mousePressEvent(self, event):
+            if (event.button() == Qt.MouseButton.LeftButton
+                    and np.hypot(event.position().x() - 95.5, event.position().y() - 95.5) <= 95):
+                self._dragging = True
+                self._pick(event.position())
+
+        def mouseMoveEvent(self, event):
+            if self._dragging:
+                self._pick(event.position())
+
+        def mouseReleaseEvent(self, event):
+            self._dragging = False
+
+    class RampColorPicker(QFrame):
+        """Small non-modal popup: HSV wheel, brightness and a hex field only."""
+        colorChanged = pyqtSignal(str)
+
+        def __init__(self, parent):
+            super().__init__(parent, Qt.WindowType.Popup)
+            self.setObjectName('localresColorPicker')
+            self.setStyleSheet('''
+                QFrame#localresColorPicker { background: #252526; border: 1px solid #555; border-radius: 5px; }
+                QWidget { background: #252526; color: #d4d4d4; }
+                QLineEdit { background: #1e1e1e; color: #d4d4d4; border: 1px solid #555; padding: 4px; }
+                QLabel { border: none; }
+            ''')
+            self.hue, self.saturation, self.value = 0.0, 0.0, 1.0
+            layout = QVBoxLayout(self)
+            layout.setContentsMargins(12, 12, 12, 12)
+            top = QHBoxLayout()
+            self.wheel = HueSaturationWheel(self)
+            self.brightness = QSlider(Qt.Orientation.Vertical)
+            self.brightness.setRange(0, 1000)
+            self.brightness.setFixedSize(26, 192)
+            self.brightness.setToolTip('Brightness')
+            top.addWidget(self.wheel)
+            top.addWidget(self.brightness)
+            layout.addLayout(top)
+            row = QHBoxLayout()
+            row.addWidget(QLabel('Hex'))
+            self.hex_edit = QLineEdit()
+            self.hex_edit.setMaxLength(7)
+            self.hex_edit.setValidator(QRegularExpressionValidator(QRegularExpression('#?[0-9A-Fa-f]{6}'), self))
+            self.hex_edit.setToolTip('RGB colour code, for example #F4B49A')
+            row.addWidget(self.hex_edit)
+            layout.addLayout(row)
+            self.wheel.changed.connect(self._wheel_changed)
+            self.brightness.valueChanged.connect(self._value_changed)
+            self.hex_edit.textEdited.connect(self._hex_changed)
+            self.hex_edit.editingFinished.connect(self._sync_controls)
+
+        def set_color(self, color):
+            hue, self.saturation, self.value, _ = QColor(color).getHsvF()
+            if hue >= 0:
+                self.hue = hue
+            self._sync_controls()
+
+        def _sync_controls(self):
+            self.wheel.hue, self.wheel.saturation = self.hue, self.saturation
+            self.wheel.update()
+            self.brightness.blockSignals(True)
+            self.brightness.setValue(round(self.value * 1000))
+            self.brightness.blockSignals(False)
+            bright = QColor.fromHsvF(self.hue, self.saturation, 1.0).name()
+            self.brightness.setStyleSheet('''
+                QSlider::groove:vertical { width: 16px; border: 1px solid #777;
+                    background: qlineargradient(x1:0,y1:0,x2:0,y2:1,stop:0 %s,stop:1 #000000); }
+                QSlider::handle:vertical { height: 6px; margin: 0 -3px; border: 1px solid #ffffff;
+                    border-radius: 1px; background: #777777; }
+            ''' % bright)
+            self.hex_edit.setText(QColor.fromHsvF(self.hue, self.saturation, self.value).name().upper())
+
+        def _publish(self):
+            self._sync_controls()
+            self.colorChanged.emit(QColor.fromHsvF(self.hue, self.saturation, self.value).name())
+
+        def _wheel_changed(self, hue, saturation):
+            self.hue, self.saturation = hue, saturation
+            self._publish()
+
+        def _value_changed(self, value):
+            self.value = value / 1000.0
+            self._publish()
+
+        def _hex_changed(self, text):
+            if self.hex_edit.hasAcceptableInput():
+                color = QColor('#' + text.lstrip('#'))
+                self.set_color(color)
+                self.colorChanged.emit(color.name())
+
+    class LocalResColorEditor(QWidget):
+        colorsChanged = pyqtSignal()
+        MAX_STOPS = 12
+
+        def __init__(self, parent=None):
+            super().__init__(parent)
+            self.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Minimum)
+            self.colors = ['#ff0000', '#ffffff', '#0000ff']
+            # Instance memory only: never written to preferences or session snapshots.
+            self._custom_colors = list(self.colors)
+            self._preset_reversed = False
+            self.selected_index = -1
+            self.picker = RampColorPicker(self)
+            self.picker.colorChanged.connect(self._set_selected_color)
+            layout = QVBoxLayout(self)
+            layout.setContentsMargins(0, 2, 0, 0)
+            layout.setSpacing(4)
+            toolbar = QHBoxLayout()
+            toolbar.setSpacing(5)
+            self.btn_add = QPushButton('+')
+            self.btn_remove = QPushButton('−')
+            for button in (self.btn_add, self.btn_remove):
+                button.setFixedSize(27, 25)
+                button.setStyleSheet('padding: 0px; font-size: 14px;')
+                toolbar.addWidget(button)
+            self.btn_add.setToolTip('Add an evenly spaced stop (up to 12)')
+            self.btn_remove.setToolTip('Remove the selected stop (at least two are required)')
+            self.presets = PanelComboBox()
+            self.presets.setMinimumWidth(145)
+            self.presets.setIconSize(QSize(42, 14))
+            for name, anchors in LOCALRES_PRESETS:
+                pixmap = QPixmap(42, 14)
+                painter = QPainter(pixmap)
+                gradient = QLinearGradient(0, 0, 42, 0)
+                for i, color in enumerate(anchors):
+                    gradient.setColorAt(i / (len(anchors) - 1), QColor(color))
+                painter.fillRect(pixmap.rect(), gradient)
+                painter.end()
+                self.presets.addItem(QIcon(pixmap), name, anchors)
+            self.presets.insertItem(1, 'Customized', None)
+            toolbar.addWidget(self.presets, 1)
+            self.btn_reverse = QPushButton('Reverse')
+            self.btn_reverse.setStyleSheet('padding: 4px 8px;')
+            self.btn_reverse.setToolTip('Reverse the colour order from low to high resolution values')
+            toolbar.addWidget(self.btn_reverse)
+            layout.addLayout(toolbar)
+            self.ramp = ResolutionRamp(self)
+            layout.addWidget(self.ramp)
+            limits = QHBoxLayout()
+            self.low_label, self.high_label = QLabel(), QLabel()
+            limits.addWidget(self.low_label)
+            limits.addStretch()
+            limits.addWidget(self.high_label)
+            layout.addLayout(limits)
+            self.rgb_row = QWidget(self)
+            rgb = QHBoxLayout(self.rgb_row)
+            rgb.setContentsMargins(0, 0, 0, 0)
+            rgb.setSpacing(5)
+            self.swatch = QPushButton()
+            self.swatch.setFixedSize(48, 24)
+            self.swatch.setToolTip('Open colour wheel')
+            rgb.addWidget(self.swatch)
+            self.rgb_inputs = []
+            for name in ('R', 'G', 'B'):
+                rgb.addWidget(QLabel(name))
+                spin = PanelSpinBox()
+                spin.setRange(0, 255)
+                spin.setFixedWidth(52)
+                spin.setButtonSymbols(QSpinBox.ButtonSymbols.NoButtons)
+                spin.setStyleSheet('QSpinBox:disabled { background: #292929; color: #666; border-color: #343434; }')
+                spin.setToolTip(name + ' channel (0–255)')
+                spin.valueChanged.connect(self._rgb_changed)
+                self.rgb_inputs.append(spin)
+                rgb.addWidget(spin)
+            rgb.addStretch()
+            layout.addWidget(self.rgb_row)
+            self.btn_add.clicked.connect(self._add_stop)
+            self.btn_remove.clicked.connect(self._remove_stop)
+            self.btn_reverse.clicked.connect(self._reverse)
+            self.presets.currentIndexChanged.connect(self._choose_preset)
+            self.ramp.selected.connect(self.select_stop)
+            self.swatch.clicked.connect(self._show_picker)
+            self._sync()
+            QApplication.instance().installEventFilter(self)
+
+        def eventFilter(self, watched, event):
+            if (event.type() == QEvent.Type.MouseButtonPress and self.isVisible()
+                    and self.selected_index >= 0 and isinstance(watched, QWidget)):
+                # Editing controls keep the selection. Backgrounds, the preview,
+                # other tabs and other windows deselect it without eating the click.
+                keep = (self.ramp, self.rgb_row, self.picker, self.btn_add,
+                        self.btn_remove, self.btn_reverse)
+                if not any((watched is widget or widget.isAncestorOf(watched))
+                           and widget.rect().contains(widget.mapFromGlobal(event.globalPosition().toPoint()))
+                           for widget in keep):
+                    self.select_stop(-1)
+            return super().eventFilter(watched, event)
+
+        def select_stop(self, index):
+            self.selected_index = index if 0 <= index < len(self.colors) else -1
+            self.picker.hide()
+            self._sync()
+
+        def _sync(self):
+            index = self.selected_index
+            selected = 0 <= index < len(self.colors)
+            self.ramp.colors = list(self.colors)
+            self.ramp.selected_index = index
+            self.ramp.update()
+            self.btn_add.setEnabled(len(self.colors) < self.MAX_STOPS)
+            self.btn_remove.setEnabled(selected and len(self.colors) > 2)
+            self.rgb_row.setEnabled(selected)
+            color = QColor(self.colors[index]) if selected else QColor('#454545')
+            self.swatch.setStyleSheet('background: %s; border: 1px solid %s; padding: 0px; border-radius: 3px;'
+                                     % (color.name(), '#98c379' if selected else '#555'))
+            for spin, value in zip(self.rgb_inputs, color.getRgb()[:3]):
+                spin.blockSignals(True)
+                spin.setValue(value if selected else 0)
+                spin.blockSignals(False)
+
+        def set_limits(self, low, high, decimal_places=1):
+            self.low_label.setText(f'{low:.{decimal_places}f} Å')
+            self.high_label.setText(f'{high:.{decimal_places}f} Å')
+
+        def _remember_custom(self):
+            self._custom_colors = list(self.colors)
+            self._preset_reversed = False
+            self.presets.blockSignals(True)
+            self.presets.setCurrentIndex(self.presets.findText('Customized'))
+            self.presets.blockSignals(False)
+
+        def _changed(self):
+            self._sync()
+            self.colorsChanged.emit()
+
+        def _choose_preset(self, index):
+            self.picker.hide()
+            self._preset_reversed = False
+            if self.presets.itemData(index) is None:
+                self.colors = list(self._custom_colors)
+            else:
+                self.colors = sample_ramp(self.presets.currentData(), len(self.colors))
+            self.selected_index = -1
+            self._changed()
+
+        def _set_selected_color(self, color):
+            if self.selected_index < 0:
+                return
+            color = QColor(color).name()
+            if color == self.colors[self.selected_index]:
+                return
+            self.colors[self.selected_index] = color
+            self._remember_custom()
+            self._changed()
+
+        def _rgb_changed(self, value):
+            self._set_selected_color(QColor(*(spin.value() for spin in self.rgb_inputs)))
+            if self.selected_index >= 0:
+                self.picker.set_color(self.colors[self.selected_index])
+
+        def _preset_colors(self, count):
+            anchors = self.presets.currentData()
+            return sample_ramp(anchors[::-1] if self._preset_reversed else anchors, count)
+
+        def _add_stop(self):
+            if len(self.colors) >= self.MAX_STOPS:
+                return
+            self.picker.hide()
+            index = min(self.selected_index + 1, len(self.colors) - 1) if self.selected_index >= 0 else len(self.colors) // 2
+            if self.presets.currentData() is not None:
+                self.colors = self._preset_colors(len(self.colors) + 1)
+            else:
+                middle = sample_ramp(self.colors[index - 1:index + 1], 3)[1]
+                self.colors.insert(index, middle)
+                self._remember_custom()
+            self.selected_index = index
+            self._changed()
+
+        def _remove_stop(self):
+            if len(self.colors) <= 2 or self.selected_index < 0:
+                return
+            self.picker.hide()
+            if self.presets.currentData() is not None:
+                self.colors = self._preset_colors(len(self.colors) - 1)
+            else:
+                self.colors.pop(self.selected_index)
+                self._remember_custom()
+            self.selected_index = min(self.selected_index, len(self.colors) - 1)
+            self._changed()
+
+        def _reverse(self):
+            self.picker.hide()
+            self.colors.reverse()
+            if self.selected_index >= 0:
+                self.selected_index = len(self.colors) - 1 - self.selected_index
+            if self.presets.currentData() is None:
+                self._remember_custom()
+            else:
+                self._preset_reversed = not self._preset_reversed
+            self._changed()
+
+        def _show_picker(self):
+            if self.selected_index < 0:
+                return
+            self.picker.set_color(self.colors[self.selected_index])
+            self.picker.adjustSize()
+            position = self.swatch.mapToGlobal(self.swatch.rect().bottomLeft())
+            screen = QApplication.screenAt(position) or QApplication.primaryScreen()
+            bounds = screen.availableGeometry()
+            x = max(bounds.left(), min(position.x(), bounds.right() - self.picker.width() + 1))
+            y = position.y() + 4
+            if y + self.picker.height() > bounds.bottom():
+                y = self.swatch.mapToGlobal(self.swatch.rect().topLeft()).y() - self.picker.height() - 4
+            self.picker.move(x, max(bounds.top(), y))
+            self.picker.show()
+            self.picker.hex_edit.setFocus()
+            self.picker.hex_edit.selectAll()
+
+        def hideEvent(self, event):
+            self.select_stop(-1)
+            super().hideEvent(event)
+
+        def dispose(self):
+            QApplication.instance().removeEventFilter(self)
+            self.picker.close()
+            self._custom_colors.clear()
+
+
     class LocalResWidget(QWidget):
+        MAX_DECIMAL_PLACES = 6
+
         def __init__(self, tool_instance, session, parent=None):
             super().__init__(parent)
             self.tool_instance = tool_instance
             self.session = session
             self._last_model_ids = set()
+            self.decimal_places = 1
             self.initUI()
+            self._color_preview_timer = QTimer(self)
+            self._color_preview_timer.setSingleShot(True)
+            self._color_preview_timer.setInterval(25)
+            self._color_preview_timer.timeout.connect(self.draw_plot)
+            self.color_editor.colorsChanged.connect(self._schedule_color_preview)
             
             self.auto_refresh_timer = QTimer(self)
             self.auto_refresh_timer.timeout.connect(self.populate_models)
@@ -5661,16 +6145,27 @@ def open_chain_modifier():
         def initUI(self):
             main_layout = QHBoxLayout(self)
             splitter = QSplitter(Qt.Orientation.Horizontal)
+            self.splitter = splitter
             
             left_widget = QWidget()
             left_layout = QVBoxLayout(left_widget)
+            self.control_panel = left_widget
+            # Recompute the content minimum when Customize expands/collapses.
+            # The scroll area takes the excess height instead of crushing fields.
+            left_layout.setSizeConstraint(QLayout.SizeConstraint.SetMinimumSize)
+            self.control_scroll = QScrollArea()
+            self.control_scroll.setFrameShape(QFrame.Shape.NoFrame)
+            self.control_scroll.setWidgetResizable(True)
+            self.control_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+            self.control_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+            self.control_scroll.setWidget(left_widget)
             
             grp_models = QGroupBox("Input")
             form_models = QFormLayout()
             
-            self.combo_map = QComboBox()
-            self.combo_locres = QComboBox()
-            self.combo_pdb = QComboBox()
+            self.combo_map = PanelComboBox()
+            self.combo_locres = PanelComboBox()
+            self.combo_pdb = PanelComboBox()
             
             form_models.addRow("Map:", self.combo_map)
             form_models.addRow("LocRes Map:", self.combo_locres)
@@ -5687,6 +6182,30 @@ def open_chain_modifier():
             
             form_params.addRow("Resolution (Å):", self.entry_res)
             form_params.addRow("Range:", self.entry_range)
+
+            decimal_row = QWidget()
+            decimal_layout = QHBoxLayout(decimal_row)
+            decimal_layout.setContentsMargins(0, 0, 0, 0)
+            decimal_layout.setSpacing(5)
+            self.btn_decimal_plus = QPushButton('+')
+            self.btn_decimal_minus = QPushButton('−')
+            for button, increment in ((self.btn_decimal_plus, 1), (self.btn_decimal_minus, -1)):
+                button.setFixedSize(27, 25)
+                button.setStyleSheet('padding: 0px; font-size: 14px;')
+                button.clicked.connect(lambda checked=False, step=increment: self._change_decimal_places(step))
+                decimal_layout.addWidget(button)
+            self.lbl_decimal_places = QLabel(': 1')
+            decimal_layout.addWidget(self.lbl_decimal_places)
+            decimal_layout.addStretch()
+            decimal_row.setToolTip('Decimal places in resolution labels (0–6). Colour thresholds retain full precision.')
+            form_params.addRow('Decimal Place', decimal_row)
+
+            self.chk_customize = QCheckBox('Customize')
+            self.chk_customize.setToolTip('Use an editable colour ramp in the preview and when running')
+            form_params.addRow(self.chk_customize)
+            self.color_editor = LocalResColorEditor(self)
+            form_params.addRow(self.color_editor)
+            self.color_editor.hide()
             
             grp_params.setLayout(form_params)
             left_layout.addWidget(grp_params)
@@ -5701,7 +6220,7 @@ def open_chain_modifier():
             level_layout = QHBoxLayout()
             self.lbl_level = QLabel("Level: ")
             self.lbl_level.setFixedWidth(120)
-            self.slider_level = QSlider(Qt.Orientation.Horizontal)
+            self.slider_level = PanelSlider(Qt.Orientation.Horizontal)
             self.slider_level.setRange(0, 1000)
             self.slider_level.setEnabled(False)
             level_layout.addWidget(self.lbl_level)
@@ -5711,12 +6230,18 @@ def open_chain_modifier():
             rms_layout = QHBoxLayout()
             self.lbl_rms = QLabel("RMS Level: 5.00")
             self.lbl_rms.setFixedWidth(120)
-            self.slider_rms = QSlider(Qt.Orientation.Horizontal)
+            self.slider_rms = PanelSlider(Qt.Orientation.Horizontal)
             self.slider_rms.setRange(0, 400)
             self.slider_rms.setEnabled(False)
             rms_layout.addWidget(self.lbl_rms)
             rms_layout.addWidget(self.slider_rms)
             v_preview.addLayout(rms_layout)
+
+            scalebar_layout = QFormLayout()
+            self.entry_scalebar = QLineEdit('10')
+            self.entry_scalebar.setToolTip('Positive scale bar length in Å, applied with Run')
+            scalebar_layout.addRow('Scale bar (Å):', self.entry_scalebar)
+            v_preview.addLayout(scalebar_layout)
             
             grp_preview.setLayout(v_preview)
             left_layout.addWidget(grp_preview)
@@ -5727,6 +6252,8 @@ def open_chain_modifier():
             self.btn_run.setStyleSheet("font-weight: bold; padding: 10px;")
             self.btn_run.clicked.connect(self.execute_commands)
             left_layout.addWidget(self.btn_run)
+            for group in (grp_models, grp_params, grp_preview):
+                group.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Minimum)
             
             right_widget = QWidget()
             right_layout = QVBoxLayout(right_widget)
@@ -5742,7 +6269,7 @@ def open_chain_modifier():
             self.canvas = FigureCanvas(self.fig)
             right_layout.addWidget(self.canvas)
             
-            splitter.addWidget(left_widget)
+            splitter.addWidget(self.control_scroll)
             splitter.addWidget(right_widget)
             splitter.setStretchFactor(0, 6)
             splitter.setStretchFactor(1, 4)
@@ -5752,6 +6279,7 @@ def open_chain_modifier():
             self.slider_level.valueChanged.connect(self.on_level_changed)
             self.slider_rms.valueChanged.connect(self.on_rms_changed)
             self.chk_overlay.toggled.connect(self.draw_plot)
+            self.chk_customize.toggled.connect(self._toggle_customize)
             self.entry_res.textChanged.connect(self.draw_plot)
             self.entry_range.textChanged.connect(self.draw_plot)
             self.combo_map.currentIndexChanged.connect(self.draw_plot)
@@ -5764,6 +6292,66 @@ def open_chain_modifier():
             self.map_max = 1
             self.map_rms = 1.0
             self._updating_sliders = False
+
+        def _schedule_color_preview(self):
+            # Coalesce rapid wheel/RGB edits while keeping the schematic live.
+            if not self._color_preview_timer.isActive():
+                self._color_preview_timer.start()
+
+        def _toggle_customize(self, checked):
+            self.color_editor.setVisible(checked)
+            self.draw_plot()
+
+        def _change_decimal_places(self, increment):
+            self.decimal_places = max(0, min(self.MAX_DECIMAL_PLACES, self.decimal_places + increment))
+            self.lbl_decimal_places.setText(f': {self.decimal_places}')
+            self.btn_decimal_minus.setEnabled(self.decimal_places > 0)
+            self.btn_decimal_plus.setEnabled(self.decimal_places < self.MAX_DECIMAL_PLACES)
+            self.draw_plot()
+
+        def _resolution_limits(self):
+            resolution = float(self.entry_res.text().strip())
+            half_range = float(self.entry_range.text().strip())
+            if (not np.isfinite(resolution) or not np.isfinite(half_range)
+                    or half_range <= 0 or resolution - half_range <= 0):
+                raise ValueError('Use a positive Range smaller than Resolution; both must be finite numbers.')
+            return resolution - half_range, resolution + half_range
+
+        def _active_colors(self):
+            return list(self.color_editor.colors) if self.chk_customize.isChecked() else ['#ff0000', '#ffffff', '#0000ff']
+
+        def _palette_commands(self, map_id, locres_id):
+            low, high = self._resolution_limits()
+            colors = self._active_colors()
+            stops = np.linspace(low, high, len(colors))
+            palette = ':'.join(f'{value:.12g},{color}' for value, color in zip(stops, colors))
+            # Keep the key readable with many stops, retaining every colour anchor.
+            labels = {0, len(colors) // 2, len(colors) - 1} if len(colors) > 5 else set(range(len(colors)))
+            key = ' '.join(f'{color}:' + (f'{stops[i]:.{self.decimal_places}f}Å' if i in labels else '')
+                           for i, color in enumerate(colors))
+            return f'color sample #{map_id} map #{locres_id} palette {palette}', 'key ' + key
+
+        def _scalebar_commands(self):
+            try:
+                length = float(self.entry_scalebar.text().strip())
+            except ValueError:
+                raise ValueError('Scale bar length must be a positive, finite number in Å.') from None
+            if not np.isfinite(length) or length <= 0:
+                raise ValueError('Scale bar length must be a positive, finite number in Å.')
+            value = f'{length:.12g}'
+            from chimerax.label.label2d import session_labels
+            labels = session_labels(self.session, create=False)
+            action = 'change' if labels is not None and labels.named_label('scalebar_legend') is not None else 'create'
+            return (f'scalebar {value} xpos 0.01 ypos 0.01',
+                    f'2dlabels {action} scalebar_legend text "{value} Å" xpos 0.01 ypos 0.02 size 20')
+
+        def dispose(self):
+            self.auto_refresh_timer.stop()
+            self._color_preview_timer.stop()
+            self.color_editor.dispose()
+            self.data_map = self.data_locres = None
+            self._preview_slices = None
+            self._preview_mask = None
 
         def on_level_changed(self, value):
             if self._updating_sliders: return
@@ -5877,6 +6465,8 @@ def open_chain_modifier():
             try:
                 self.data_map = map_model.data.matrix().astype(np.float32)
                 self.data_locres = locres_model.data.matrix().astype(np.float32)
+                self._preview_slices = None
+                self._preview_mask = None
                 
                 self.map_min = float(np.min(self.data_map))
                 self.map_max = float(np.max(self.data_map))
@@ -5917,6 +6507,13 @@ def open_chain_modifier():
                 return False
 
         def draw_plot(self):
+            try:
+                vmin, vmax = self._resolution_limits()
+                self.color_editor.set_limits(vmin, vmax, self.decimal_places)
+            except ValueError:
+                self.color_editor.low_label.setText('— Å')
+                self.color_editor.high_label.setText('— Å')
+                return
             if not self.load_data() or self.data_map is None or self.data_locres is None:
                 self.ax.clear()
                 self.ax.axis('off')
@@ -5941,8 +6538,9 @@ def open_chain_modifier():
             import matplotlib.colors as mcolors
             
             try:
-                r = float(self.entry_res.text().strip())
-                rg = float(self.entry_range.text().strip())
+                # Loading a new map can set an automatic resolution threshold.
+                vmin, vmax = self._resolution_limits()
+                self.color_editor.set_limits(vmin, vmax, self.decimal_places)
             except ValueError:
                 return
 
@@ -5957,10 +6555,12 @@ def open_chain_modifier():
             z_start = max(0, current_z - slice_thickness // 2)
             z_end = min(max_z, current_z + slice_thickness // 2 + 1)
 
-            slice_map = np.mean(self.data_map[z_start:z_end, :, :], axis=0)
-            
             if self.data_map.shape == self.data_locres.shape:
-                slice_locres = np.mean(self.data_locres[z_start:z_end, :, :], axis=0)
+                if getattr(self, '_preview_slices', None) is None:
+                    self._preview_slices = (
+                        np.mean(self.data_map[z_start:z_end, :, :], axis=0),
+                        np.mean(self.data_locres[z_start:z_end, :, :], axis=0))
+                slice_map, slice_locres = self._preview_slices
             else:
                 self.ax.clear()
                 self.ax.axis('off')
@@ -5983,17 +6583,18 @@ def open_chain_modifier():
             img_base.set_clip_path(clip_circle)
 
             if self.chk_overlay.isChecked():
-                cmap = mcolors.LinearSegmentedColormap.from_list("rwb", ["red", "white", "blue"])
-                vmin = r - rg
-                vmax = r + rg
-                norm = mcolors.Normalize(vmin=vmin, vmax=vmax)
-
                 import scipy.ndimage
-                base_mask = np.where(slice_map > current_threshold, 1.0, 0.0)
-                smooth_mask = scipy.ndimage.gaussian_filter(base_mask, sigma=0.8)
-                alpha_mask = np.clip(smooth_mask * 1.5, 0.0, 0.9) 
-                
-                rgba_img = cmap(norm(slice_locres))
+                cached_mask = getattr(self, '_preview_mask', None)
+                if cached_mask is None or cached_mask[0] != current_threshold:
+                    base_mask = np.where(slice_map > current_threshold, 1.0, 0.0)
+                    smooth_mask = scipy.ndimage.gaussian_filter(base_mask, sigma=0.8)
+                    self._preview_mask = (current_threshold, np.clip(smooth_mask * 1.5, 0.0, 0.9))
+                alpha_mask = self._preview_mask[1]
+                colors = np.array([mcolors.to_rgb(color) for color in self._active_colors()])
+                positions = np.linspace(vmin, vmax, len(colors))
+                rgba_img = np.ones(slice_locres.shape + (4,), dtype=float)
+                for channel in range(3):
+                    rgba_img[..., channel] = np.interp(slice_locres, positions, colors[:, channel])
                 rgba_img[..., 3] = alpha_mask 
 
                 img_overlay = self.ax.imshow(rgba_img, origin='lower', interpolation='bilinear')
@@ -6018,25 +6619,25 @@ def open_chain_modifier():
             pdb_id = pdb_model.id_string
 
             try:
-                res_val = float(self.entry_res.text().strip())
-                range_val = float(self.entry_range.text().strip())
-            except ValueError:
-                QMessageBox.critical(self, "Error", "Resolution and Range must be numbers")
+                color_command, key_command = self._palette_commands(map_id, locres_id)
+            except ValueError as error:
+                QMessageBox.critical(self, "Invalid Color Threshold", str(error))
+                return
+            try:
+                scalebar_command, scalebar_label_command = self._scalebar_commands()
+            except ValueError as error:
+                QMessageBox.critical(self, "Invalid Scale Bar", str(error))
                 return
 
-            low = res_val - range_val
-            mid = res_val
-            high = res_val + range_val
-
             commands = f"""
-color sample #{map_id} map #{locres_id} palette {low:.1f},#ff0000:{mid:.1f},#ffffff:{high:.1f},#0000ff 
+{color_command}
 surface dust #{map_id}
 set bgColor #ffffff00
 hide #{locres_id} models 
 graphics silhouettes true
 graphics silhouette width 20
 ui tool show "Surface Color"
-key red-white-blue :{low:.1f}Å :{mid:.1f}Å :{high:.1f}Å
+{key_command}
 key fontSize 14
 key pos 0.8000,0.06000
 key size 0.15000,0.03000
@@ -6046,8 +6647,8 @@ hide #{pdb_id} models
 hide #{locres_id} models
 view orient
 zoom pixelSize 0.18
-scalebar 10 xpos 0.01 ypos 0.01
-2dlabels create scalebar_legend text "10 Å" xpos 0.01 ypos 0.02 size 20
+{scalebar_command}
+{scalebar_label_command}
 volume #{map_id} step 1
 volume #{map_id} rmsLevel {self.slider_rms.value() / 40.0:.2f}
 lighting soft
@@ -6195,6 +6796,7 @@ class PDBModifierTool(ToolInstance):
         """)
         
     def delete(self):
+        self.widget.localres_widget.dispose()
         for sub_widget in (self.widget.pdb_widget, self.widget.cif_widget):
             sub_widget.auto_refresh_timer.stop()
             sub_widget.working_structure = None
