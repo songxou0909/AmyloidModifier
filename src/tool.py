@@ -1,3 +1,10 @@
+"""Amyloid Modifier: structured editing, repeat geometry, and ChimeraX widgets.
+
+The implementation intentionally stays in one file. Geometry and structure I/O
+remain usable without ChimeraX; the native adapter and GUI follow those helpers.
+Physical layers and chain units are distinct: expansion counts whole chain units.
+"""
+
 import os
 import math
 from io import StringIO
@@ -8,11 +15,44 @@ import json
 import tempfile
 import hashlib
 import base64
+from functools import wraps
+from itertools import product
+from typing import NamedTuple
 from collections import Counter, defaultdict
+
+
+VERSION = '2.1.3'
+# Below this per-cycle angle, a free rotation axis is dominated by coordinate
+# rounding/noise. Use the measured repeat direction to constrain the rotation.
+MIN_RESOLVED_ROTATION_DEGREES = 0.05
+MAX_REPEAT_CORE_RMSD = 1.5
+MIN_NEW_CA_SEPARATION = 0.5
+RIGID_REPEAT_COORDINATE_TOLERANCE = 0.002  # Angstrom; accommodates 0.001-A coordinate rounding.
 
 
 class StructureEditError(ValueError):
     pass
+
+
+class RepeatTransform(NamedTuple):
+    """One fitted cycle; twist/rise are normalized per chain unit."""
+    rotation: object
+    translation: object
+    axis: object
+    twist: float
+    rise: float
+    rmsd: float
+    diagnostics: dict
+
+
+def automatic_water_axial_limit(detection):
+    """Half the median physical layer spacing, plus 10% of that half-spacing."""
+    from statistics import median
+    spacings = [track.get('layer_spacing')
+                for track in (detection or {}).get('protofilaments', [])]
+    spacings = [float(value) for value in spacings
+                if value is not None and math.isfinite(float(value)) and float(value) > 0]
+    return 0.55 * median(spacings) if spacings else None
 
 
 def _structure_dependencies():
@@ -21,11 +61,11 @@ def _structure_dependencies():
         import numpy as np
     except (ImportError, OSError) as exc:
         raise StructureEditError(
-            "Amyloid Modifier's structure libraries could not be loaded. "
-            "Install the latest Amyloid Modifier update through Tools > "
-            "More Tools with dependency installation enabled, then restart "
-            "ChimeraX. The installer supplies Gemmi automatically; no commands "
-            "are needed. NumPy is included with ChimeraX.\n\n"
+            "Amyloid Modifier's structure libraries could not be loaded.\n"
+            "To repair the installation, run this in the ChimeraX command line:\n"
+            "toolshed uninstall amyloidmodifier\n"
+            "Then reinstall Amyloid Modifier through Tools > More Tools "
+            "and restart ChimeraX.\n\n"
             f"Details: {exc}"
         ) from exc
     return gemmi, np
@@ -141,12 +181,14 @@ class StructureBuffer:
         self.text = text
         self.report = deepcopy(report)
         self.component_styles = None
+        self.active_alt_locs = None
         self.format = 'cif' if self.name.lower().endswith(('.cif', '.mmcif')) else 'pdb'
 
     def copy_from(self, other):
         self.text = other.text
         self.report = deepcopy(other.report)
         self.component_styles = deepcopy(other.component_styles)
+        self.active_alt_locs = deepcopy(other.active_alt_locs)
         self.format = other.format
 
 
@@ -192,7 +234,7 @@ class StructureEditor:
     )
 
     def __init__(self, path, *, metadata_policy="preserve", pdb_mode="extended"):
-        gemmi, np = _structure_dependencies()
+        gemmi, _ = _structure_dependencies()
         if metadata_policy not in ("error", "audit", "preserve") or pdb_mode not in ("extended", "strict"):
             raise StructureEditError("Invalid metadata policy or PDB mode.")
         buffer = path if isinstance(path, StructureBuffer) else None
@@ -213,7 +255,7 @@ class StructureEditor:
         self.metadata_policy = metadata_policy
         self.pdb_mode = pdb_mode
         self.report = {"source": self.path, "source_sha256": source_hash,
-                       "engine": "AmyloidModifier trial structured I/O", "gemmi": gemmi.__version__,
+                       "engine": "AmyloidModifier", "version": VERSION, "gemmi": gemmi.__version__,
                        "pdb_mode": pdb_mode, "warnings": [], "metadata": {}, "chain_copies": [],
                        "validation_scope": "syntax, identities, references and coordinate round-trip; not wwPDB deposition validation"}
         previous_path = self.path + '.audit.json'
@@ -224,7 +266,10 @@ class StructureEditor:
                     with open(previous_path, encoding='utf-8') as handle:
                         previous = json.load(handle)
                 if previous.get('output_sha256') == self.report['source_sha256']:
-                    fields = ('operation','source','source_sha256','output','output_sha256','chain_copies','geometry','inferred_covalent_links','ensemble_selection')
+                    fields = ('engine', 'version', 'gemmi', 'operation', 'source', 'source_sha256',
+                              'output', 'output_sha256', 'chain_copies', 'geometry', 'automatic_fit',
+                              'overlap_check', 'terminal_completion', 'warnings',
+                              'inferred_covalent_links', 'ensemble_selection')
                     self.report['history'] = previous.get('history', []) + [{k:previous[k] for k in fields if k in previous}]
                     archive = dict(previous.get('inherited_metadata_archive', {}))
                     archive.update({k:v for k,v in previous.get('metadata',{}).items() if 'source_content' in v})
@@ -514,6 +559,8 @@ class StructureEditor:
             if old is None or rank > old[0]:
                 candidates[chain][key] = (rank, row)
         return {c: [{"id": (k[0] + k[1]), "key": k,
+                      "sequence_key": ((str(r['label_entity_id']), str(r['label_seq_id']), r['label_comp_id'])
+                                       if _present(r.get('label_entity_id')) and _present(r.get('label_seq_id')) else None),
                       "coord": np.array([float(r[f]) for f in ("Cartn_x", "Cartn_y", "Cartn_z")])}
                     for k, (_, r) in residues.items()] for c, residues in candidates.items()}
 
@@ -531,7 +578,8 @@ class StructureEditor:
         return self.ca_chains(), waters, others
 
     def companion_groups(self):
-        # A nonprotein polymer is one molecule, not independent nucleotide ligands.
+        # Keep a nonprotein polymer, and any explicitly covalently connected
+        # nonprotein residues, together as a complete companion molecule.
         groups = defaultdict(list)
         for row in self.atoms:
             label = row['label_asym_id']
@@ -539,7 +587,31 @@ class StructureEditor:
                 continue
             key = ('polymer', label) if label in self.poly_labels else ('residue', _residue_key(row))
             groups[key].append(row)
-        return list(groups.values())
+        by_atom = {r['id']: key for key, rows in groups.items() for r in rows}
+        parent = {key: key for key in groups}
+        def root(key):
+            while parent[key] != key:
+                key = parent[key]
+            return key
+        def join(a, b):
+            if a in by_atom and b in by_atom:
+                ra, rb = root(by_atom[a]), root(by_atom[b])
+                if ra != rb:
+                    parent[rb] = ra
+        for a, b, _ in self.pdb_bonds:
+            join(a, b)
+        connections = [r for r in _cif_rows(self.block, '_struct_conn.')
+                       if r.get('conn_type_id') in ('covale', 'disulf', 'modres')]
+        if connections:
+            index = _AtomIndex([r for rows in groups.values() for r in rows])
+            for row in connections:
+                for a in index.matches(row, 'ptnr1_'):
+                    for b in index.matches(row, 'ptnr2_'):
+                        join(a['id'], b['id'])
+        merged = defaultdict(list)
+        for key, rows in groups.items():
+            merged[root(key)].extend(rows)
+        return list(merged.values())
 
     def associated_residues(self, core_chains, axial_limit=4.0, axis=None):
         # Assign complete companion molecules once, to the nearest protein chain.
@@ -610,7 +682,12 @@ class StructureEditor:
             center = xyz.mean(0)
             pf, layer = locations[owners[key]]
             entry = dict(key=key, keys=keys, layer=layer, center=center,
-                         extent=float(np.ptp(xyz @ axis)), owner=owners[key])
+                         extent=float(np.ptp(xyz @ axis)), owner=owners[key],
+                         xyz=xyz, polymer=rows[0]['label_asym_id'] in self.poly_labels)
+            # Atom order must not affect the orientation comparison between copies.
+            entry['xyz'] = xyz[sorted(range(len(rows)), key=lambda i:
+                (keys.index(_residue_key(rows[i])), rows[i]['label_atom_id'],
+                 _null_id(rows[i].get('label_alt_id'))))]
             identity = ('+'.join(k[-1] for k in keys),
                         frozenset((keys.index(_residue_key(r)), r['label_atom_id']) for r in rows))
             if len(keys) > 1:
@@ -621,8 +698,15 @@ class StructureEditor:
                 spacing = np.abs(np.diff(projections))
                 if np.all((spacing > .5 * rise) & (spacing < 1.5 * rise)):
                     entry['polymer_period'] = max(1, int(round((np.ptp(projections) + np.median(spacing)) / rise)))
-            site = next((s for s in sites if s['identity'] == identity and s['pf'] == pf and
-                         all(layer != r['layer'] for r in s['residues']) and
+            # Nearest protein centroids can switch protofilaments at a terminal
+            # overhang. A molecular track is identified by its own transverse
+            # position and axial separation, not that clipped owner assignment.
+            site = next((s for s in sites if s['identity'] == identity and
+                         (s['pf'] == pf or (len(xyz) >= 6 and not entry['polymer'] and
+                                           not any(r['polymer'] for r in s['residues']))) and
+                         all((abs(float((center - r['center']) @ axis)) > .5 * rise
+                              if len(xyz) >= 6 else layer != r['layer'])
+                             for r in s['residues']) and
                          any(np.linalg.norm((center - r['center']) - np.dot(center - r['center'], axis) * axis) <= 4.0
                              for r in s['residues'])), None)
             if site is None:
@@ -634,13 +718,30 @@ class StructureEditor:
             gaps = [b['layer'] - a['layer'] for a, b in zip(members, members[1:])]
             extent = float(np.median([r['extent'] for r in members]))
             inferred = members[0].get('polymer_period', 1 if extent < rise else int(math.ceil(extent / rise)) + 1)
-            if gaps and all('polymer_period' in r for r in members):
-                # After trimming, a terminal RNA can extend beyond the protein
-                # bounds; its nearest remaining owner is shifted inward. Measure
-                # the actual repeat separation rather than that clipped index.
+            if gaps and (len(members[0]['xyz']) >= 6 or all('polymer_period' in r for r in members)):
+                # Terminal companions can extend beyond the protein bounds;
+                # measure separation rather than a clipped nearest-owner index.
                 positions = sorted(float(r['center'] @ axis) for r in members)
                 gaps = [max(1, int(round((b - a) / rise))) for a, b in zip(positions, positions[1:])]
             site['period'] = max(1, min(gaps)) if gaps else inferred
+            # Repeated small molecules can overhang a terminal protein layer.
+            # Recover their positions from molecular separation, not the clipped
+            # nearest-protein index. Preserve the observed coverage at each end.
+            ordered = sorted(members, key=lambda r: float(r['center'] @ axis))
+            positions = [float(r['center'] @ axis) for r in ordered]
+            site['observed_track'] = (len(ordered) >= 2 and
+                len(ordered[0]['xyz']) >= 6 and
+                not any(r['polymer'] for r in ordered) and site['period'] == 1 and
+                all(abs((b - a) / rise - 1) < .25 for a, b in zip(positions, positions[1:])))
+            if site['observed_track']:
+                first_layer = ordered[0]['layer']
+                for offset, residue in enumerate(ordered):
+                    residue['layer'] = first_layer + offset
+            # Endpoint coverage can only be extrapolated when the observed
+            # ligand track covers essentially the entire protein stack. A short
+            # internal patch must not be treated as if it reached both ends.
+            site['terminal_track'] = (site['observed_track'] and
+                len(ordered) >= len(sandwiches[site['pf']]) - 1)
         phases = defaultdict(Counter)
         for site in sites:
             period = site['period']
@@ -679,6 +780,12 @@ class StructureEditor:
         sites = self.associated_residue_repeats(sandwiches, axis, rise, axial_limit)
         midpoint = float(np.mean(sorted(kept)))
         for site in sites:
+            if site.get('terminal_track') and kept == set(range(min(kept), max(kept) + 1)):
+                members = sorted(site['residues'], key=lambda r: r['layer'])
+                result.difference_update(k for r in members for k in r['keys'])
+                end = max(0, len(members) - (len(sandwiches[0]) - 1 - max(kept)))
+                result.update(k for r in members[min(kept):end] for k in r['keys'])
+                continue
             if site['period'] == 1:
                 continue
             members = site['residues']
@@ -1345,7 +1452,6 @@ class StructureEditor:
         # Propagate annotated covalent topology across repeat boundaries.
         _, np = _structure_dependencies()
         locations = {chain: (pf, layer) for pf, strand in enumerate(sandwiches) for layer, chain in enumerate(strand)}
-        depth = len(sandwiches[0])
         source_by_id = {r['id']: r for r in self.atoms}
         source_first = _AtomIndex([r for r in self.atoms if str(r['pdbx_PDB_model_num']) == self.models[0]])
         output_by_key = {_atom_key(r): r for r in self.output_atoms}
@@ -1391,14 +1497,29 @@ class StructureEditor:
                 continue  # Nonpolymer copies already follow their assigned owner.
             pfa, la = locations[a['auth_asym_id']]
             pfb, lb = locations[b['auth_asym_id']]
+            if a['auth_asym_id'] == b['auth_asym_id']:
+                # Whole-chain copies already carry their donor's internal bonds.
+                # A bond annotated in a different layer must not bridge an
+                # existing break in this donor chain (for example, 8FNZ).
+                continue
             for dest_a in all_layers:
                 shift = dest_a - la
                 dest_b = lb + shift
                 if shift % layer_step or (pfa, dest_a) not in instances or (pfb, dest_b) not in instances:
                     continue
-                if 0 <= dest_a < depth and 0 <= dest_b < depth:
-                    continue
                 chain_a, chain_b = instances[pfa, dest_a], instances[pfb, dest_b]
+                if chain_a in locations and chain_b in locations:
+                    continue  # Existing links stay fixed, including unequal ends.
+                # A link copied with both of its donor atoms already has the
+                # donor's exact geometry. Another observed layer may have a
+                # different bond length; it is not the reference for this copy.
+                copied_pair = tuple(sorted((
+                    (chain_a, _null_id(a['auth_seq_id']), a['label_comp_id'], a['label_atom_id'],
+                     _null_id(a.get('pdbx_PDB_ins_code')), _null_id(a.get('label_alt_id'))),
+                    (chain_b, _null_id(b['auth_seq_id']), b['label_comp_id'], b['label_atom_id'],
+                     _null_id(b.get('pdbx_PDB_ins_code')), _null_id(b.get('label_alt_id'))))))
+                if copied_pair in seen:
+                    continue
                 model_pairs = []
                 for model in self.models:
                     ka, kb = list(_atom_key(a)), list(_atom_key(b))
@@ -1673,7 +1794,7 @@ class StructureEditor:
         for group in self.groups:
             live = {(r['auth_asym_id'], r['auth_seq_id'], _null_id(r.get('pdbx_PDB_ins_code')), r['label_comp_id'])
                     for r in group['rows']}
-            for old, parts in sites.items():
+            for parts in sites.values():
                 kept = []
                 for part in parts:
                     chain, seq, ins, res = part[3:5].strip(), part[5:9].strip(), part[9].strip(), part[:3].strip()
@@ -1835,6 +1956,38 @@ def _short_unknown_chain(residues):
     return 4 <= len(residues) <= 12 and all(tuple(r.get('key', ()))[-1:] == ('UNK',) for r in residues)
 
 
+def _compatible_residue_keys(a, b):
+    if a == b:
+        return True
+    small, large = sorted((set(a), set(b)), key=len)
+    return len(small) >= max(6, .75 * len(large)) and small.issubset(large)
+
+
+def _sequence_coordinate_pairs(first, second):
+    """Fallback for equivalent residues with different author numbering.
+
+    Explicit mmCIF entity/sequence positions provide correspondence, while
+    deposited author IDs remain untouched. Do not infer a sequence alignment
+    from spatial proximity or quietly pair different residue types.
+    """
+    import numpy as np
+    maps = []
+    for residues in (first, second):
+        keys = [r.get('sequence_key') for r in residues]
+        if len(keys) < 6 or any(k is None or k[-1] == 'UNK' for k in keys):
+            return None
+        if len({k[:2] for k in keys}) != len(keys):
+            return None
+        if len({k[0] for k in keys}) != 1:
+            return None
+        maps.append(dict(zip(keys, residues)))
+    a, b = maps
+    if not _compatible_residue_keys(a.keys(), b.keys()):
+        return None
+    common = [k for k in a if k in b]
+    return np.array([a[k]['coord'] for k in common]), np.array([b[k]['coord'] for k in common])
+
+
 def _repeat_coordinate_pairs(first, second):
     # Align short unassigned peptides independently of author residue numbering.
     import numpy as np
@@ -1842,6 +1995,12 @@ def _repeat_coordinate_pairs(first, second):
     b = {r['key']: r['coord'] for r in second}
     if set(a) == set(b):
         return np.array(list(a.values())), np.array([b[k] for k in a])
+    if _compatible_residue_keys(a.keys(), b.keys()):
+        common = [k for k in a if k in b]
+        return np.array([a[k] for k in common]), np.array([b[k] for k in common])
+    sequence_pairs = _sequence_coordinate_pairs(first, second)
+    if sequence_pairs is not None:
+        return sequence_pairs
     if not (_short_unknown_chain(first) and _short_unknown_chain(second)):
         raise StructureEditError('C-alpha residue identities differ between equivalent repeat positions; resolve alignment before automatic fitting.')
     p, q = np.array(list(a.values())), np.array(list(b.values()))
@@ -1892,6 +2051,11 @@ def _backbone_stack_contacts(p, q, axis=None, antiparallel=True):
     import numpy as np
     direction = -1 if antiparallel else 1
     required = max(6, math.ceil(.25 * min(len(p), len(q))))
+    if antiparallel and 6 <= min(len(p), len(q)) < 8:
+        # A seven-residue strand has only five interior backbone tangents.
+        # Keep the four-contact consecutive reverse-register requirement below
+        # and require most of the available interior residues for short strands.
+        required = max(4, math.ceil(.8 * (min(len(p), len(q)) - 2)))
     if min(len(p), len(q)) < required + 2:
         return None
     # Reject distant chains before allocating contact blocks.
@@ -1968,12 +2132,89 @@ def _backbone_stack_contacts(p, q, axis=None, antiparallel=True):
                 rungs=1, gap=1, spacing=rise)
 
 
+def _shared_detection_helix(candidates, axis):
+    """Recover wide helical repeats using independent, already aligned pairs.
+
+    A centroid follows a circular arc around a screw axis. Its transverse
+    displacement is not a stacking error, but a pair's own rigid fit alone
+    cannot distinguish that arc from a displaced chain. Require several pairs
+    to agree on one transform before relaxing the transverse-distance gate.
+    """
+    import numpy as np
+    anchors = []
+    for e in candidates:
+        dz = float(e['vector'] @ axis)
+        lateral = np.linalg.norm(e['vector'] - dz * axis)
+        if e['rmsd'] > .35 or not 4.0 <= abs(dz) <= 5.7 or lateral > 2.0:
+            continue
+        p, q = e['core_p'], e['core_q']
+        rotation = e['rotation']
+        if dz < 0:
+            p, q, rotation = q, p, rotation.T
+        anchors.append((e, p, q, rotation, q.mean(0) - rotation @ p.mean(0)))
+    if len(anchors) < 3:
+        return None
+    centers_p = np.array([a[1].mean(0) for a in anchors])
+    centers_q = np.array([a[2].mean(0) for a in anchors])
+    rotations = np.array([a[3] for a in anchors])
+    best = []
+    for _, p, q, rotation, translation in anchors:
+        # Both rotation and its action at each pair's location must agree.
+        center_error = np.linalg.norm(centers_p @ rotation.T + translation - centers_q, axis=1)
+        cos_angles = (np.einsum('nij,ij->n', rotations, rotation) - 1) / 2
+        support = np.flatnonzero((center_error <= .35) &
+                                 (cos_angles >= math.cos(math.radians(.5))))
+        if len(support) > len(best):
+            best = support
+    if len(best) < 3:
+        return None
+    members = [anchors[i] for i in best]
+    if len({c for e, *_ in members for c in (e['a'], e['b'])}) < 4:
+        return None
+    p = np.concatenate([a[1] for a in members])
+    q = np.concatenate([a[2] for a in members])
+    fit = _fit_detection_core(p, q, 1.)
+    if fit is None or fit['rmsd'] > .35:
+        return None
+    rotation = fit['rotation']
+    translation = q.mean(0) - rotation @ p.mean(0)
+    skew = np.array([rotation[2, 1] - rotation[1, 2],
+                     rotation[0, 2] - rotation[2, 0],
+                     rotation[1, 0] - rotation[0, 1]]) / 2
+    sine = np.linalg.norm(skew)
+    if sine < math.sin(math.radians(.1)):
+        return None  # Near-zero twist does not determine a reliable screw axis.
+    screw_axis = skew / sine
+    if screw_axis @ axis < 0:
+        screw_axis = -screw_axis
+    if screw_axis @ axis < math.cos(math.radians(15)):
+        return None
+    rise = float(translation @ screw_axis)
+    if not 4.0 <= rise <= 5.7:
+        return None
+    supported, recovered = set(), False
+    for i, e in enumerate(candidates):
+        p, q = e['core_p'], e['core_q']
+        if e['vector'] @ screw_axis < 0:
+            p, q = q, p
+        error = np.linalg.norm(p @ rotation.T + translation - q, axis=1)
+        if np.sqrt(np.mean(error ** 2)) > .5:
+            continue
+        supported.add(i)
+        dz = float(e['vector'] @ axis)
+        lateral = np.linalg.norm(e['vector'] - dz * axis)
+        recovered |= lateral > max(2.0, .30 * abs(dz))
+    # Leave the established detector untouched unless the shared transform
+    # actually explains an otherwise rejected transverse displacement.
+    return (screw_axis, supported) if recovered else None
+
+
 def detect_layers(chains, axis_hint=None):
     # Detect whole chain units; a chain may span multiple physical layers.
     import numpy as np
     ids = sorted(chains)
     if not ids:
-        raise StructureEditError('No protein C-alpha atoms available for detection.')
+        raise StructureEditError('No C-alpha detected; detection failed.')
     maps, points = {}, {}
     for cid in ids:
         maps[cid] = {}
@@ -2004,10 +2245,25 @@ def detect_layers(chains, axis_hint=None):
                 contact = _backbone_stack_contacts(points[a], points[b], antiparallel=False)
                 if contact is not None:
                     contact_candidates.append(dict(contact, a=a, b=b))
-            if len(common) < max(6, math.ceil(.5 * min(len(maps[a]), len(maps[b])))):
-                continue
-            p = np.array([maps[a][k] for k in common])
-            q = np.array([maps[b][k] for k in common])
+            # Short assigned peptides use every residue in the same repeat fit.
+            # They must match completely; unlike a long chain there is no spare
+            # core support to trim away mismatches or flexible residues.
+            short_assigned = (3 <= len(maps[a]) < 6 and set(maps[a]) == set(maps[b])
+                              and all(len(k) >= 3 and k[-1] != 'UNK' for k in maps[a]))
+            if not short_assigned and len(common) < max(6, math.ceil(.5 * min(len(maps[a]), len(maps[b])))):
+                pairs = _sequence_coordinate_pairs(chains[a], chains[b])
+                if pairs is None:
+                    continue
+                p, q = pairs
+            else:
+                p = np.array([maps[a][k] for k in common])
+                q = np.array([maps[b][k] for k in common])
+            if short_assigned:
+                delta = q - p
+                residual = float(np.sqrt(np.mean(np.sum((delta - delta.mean(0)) ** 2, axis=1))))
+                if (residual > .9 or np.linalg.matrix_rank(p - p.mean(0)) < 2
+                        or np.linalg.matrix_rank(q - q.mean(0)) < 2):
+                    continue
             lengths = np.linalg.norm(q - p, axis=1)
             if np.percentile(lengths, 25) > 36 or np.max(lengths) < 3.5:
                 continue
@@ -2031,6 +2287,7 @@ def detect_layers(chains, axis_hint=None):
             candidates.append(dict(a=a, b=b, vector=vector, distance=distance,
                                    rmsd=fit['rmsd'], support=len(mask),
                                    orientation='parallel',
+                                   rotation=fit['rotation'], core_p=p[mask], core_q=q[mask],
                                    center_a=p[mask].mean(0), center_b=q[mask].mean(0)))
 
     warnings = []
@@ -2044,6 +2301,7 @@ def detect_layers(chains, axis_hint=None):
     edges = []
     rung_evidence = {}
     multiplicity = {c: 1 for c in ids}
+    shared_helix = None
     axis_candidates = candidates or contact_candidates
     if axis_candidates:
         # Estimate direction from nearest repeats, independent of sign and lateral separation.
@@ -2058,9 +2316,12 @@ def detect_layers(chains, axis_hint=None):
         axis = vt[0]
         if axis[np.argmax(np.abs(axis))] < 0:
             axis = -axis
+        shared_helix = _shared_detection_helix(candidates, axis)
+        if shared_helix is not None:
+            axis = shared_helix[0]
         for c in ids:
             multiplicity[c], rung_evidence[c] = _internal_rung_evidence(points[c], axis)
-        for e in candidates:
+        for index, e in enumerate(candidates):
             dz = float(e['vector'] @ axis)
             lateral = float(np.linalg.norm(e['vector'] - dz * axis))
             k = min(multiplicity[e['a']], multiplicity[e['b']])
@@ -2069,7 +2330,9 @@ def detect_layers(chains, axis_hint=None):
             k = min(k, repeat_rungs)
             gap = max(1, round(abs(dz) / (4.8 * k)))
             spacing = abs(dz) / (gap * k)
-            if gap > 3 or not 4.0 <= spacing <= 5.7 or lateral > max(2.0, .30 * abs(dz)):
+            helical_neighbor = shared_helix is not None and index in shared_helix[1]
+            if (gap > 3 or not 4.0 <= spacing <= 5.7 or
+                    (lateral > max(2.0, .30 * abs(dz)) and not helical_neighbor)):
                 continue
             if dz < 0:
                 e = dict(e, a=e['b'], b=e['a'], center_a=e['center_b'], center_b=e['center_a'])
@@ -2122,6 +2385,54 @@ def detect_layers(chains, axis_hint=None):
         down[b] = e
         chosen.append(e)
 
+    # A flexible terminal chain can fail the rigid-core cutoff while still
+    # forming a well-supported beta-sheet with an established stack. Join only
+    # unambiguous path ends; never replace accepted edges or use these weaker
+    # fits to estimate the axis. This also recognizes an expanded flexible end.
+    if chosen and axis is not None:
+        paths = []
+        for start in ids:
+            if start in down:
+                continue
+            path = [start]
+            while path[-1] in up:
+                path.append(up[path[-1]]['b'])
+            if all(up[c]['rungs'] == 1 and up[c]['gap'] == 1 and
+                   up[c]['orientation'] == 'parallel' for c in path[:-1]):
+                paths.append(path)
+        recoveries = []
+        for first in paths if len({len(p) for p in paths}) > 1 else []:
+            for second in paths:
+                if first is second or max(len(first), len(second)) < 3:
+                    continue
+                a, b = first[-1], second[0]
+                if set(maps[a]) != set(maps[b]):
+                    continue
+                p, q = _repeat_coordinate_pairs(chains[a], chains[b])
+                if np.percentile(np.linalg.norm(q - p, axis=1), 25) > 12:
+                    continue
+                fit = _fit_detection_core(p, q)
+                if fit is None or fit['rmsd'] > 1.5:
+                    continue
+                angle = math.degrees(math.acos(float(np.clip((np.trace(fit['rotation']) - 1) / 2, -1, 1))))
+                vector = (q - p)[fit['mask']].mean(0)
+                dz = float(vector @ axis)
+                if angle > 25 or not 4.0 <= dz <= 5.7 or np.linalg.norm(vector - dz * axis) > 2.0:
+                    continue
+                contact = _backbone_stack_contacts(points[a], points[b], axis, antiparallel=False)
+                if contact is None:
+                    continue
+                recoveries.append(dict(contact, a=a, b=b, rmsd=fit['rmsd']))
+        counts = Counter((side, e[side]) for e in recoveries for side in ('a', 'b'))
+        for e in recoveries:
+            if counts['a', e['a']] != 1 or counts['b', e['b']] != 1:
+                continue
+            up[e['a']] = e
+            down[e['b']] = e
+            chosen.append(e)
+            warnings.append('Flexible stack boundary ' + e['a'] + ' / ' + e['b'] +
+                            ' joined by supported backbone contacts along the established axis.')
+
     if not chosen and hint is not None:
         axis = hint
         for c in ids:
@@ -2171,7 +2482,7 @@ def detect_layers(chains, axis_hint=None):
                 antiparallel=any(e['orientation'] == 'antiparallel' for e in chosen),
                 sandwiches=[t['chains'] for t in tracks],
                 axis=axis.tolist() if axis is not None else None,
-                axis_source=('neighbor repeats' if candidates else
+                axis_source=('shared helical repeats' if shared_helix is not None else 'neighbor repeats' if candidates else
                              ('antiparallel backbone contacts' if orientation == 'antiparallel' else 'backbone contacts')) if chosen else ('supplied parent axis' if hint is not None else 'undetermined'),
                 detected_units=max(t['units'] for t in tracks),
                 detected_layers=max(t['layers'] for t in tracks),
@@ -2201,10 +2512,27 @@ def _expansion_repeat_pattern(chains, sandwiches):
         pure_anti |= bool(flips) and all(flips)
         tags.append(stack_tags)
     depth = len(sandwiches[0])
+    def same_identity(a, b, first, second):
+        if a == b:
+            return True
+        if isinstance(a, frozenset) and isinstance(b, frozenset):
+            # Unmodelled residues do not change protein identity. Require a
+            # substantial matching sequence and no contradictory residue keys.
+            if _compatible_residue_keys(a, b):
+                return True
+        return _sequence_coordinate_pairs(chains[first], chains[second]) is not None
     def compatible(period):
         return (not (pure_anti and period % 2) and
-                all(all(t[i] == t[i + period] for i in range(len(t) - period)) for t in tags))
-    period = next((p for p in range(1, depth + 1) if compatible(p)), depth + 1)
+                all(all(t[i][1] == t[i + period][1] and same_identity(t[i][0], t[i + period][0], stack[i], stack[i + period])
+                        for i in range(len(t) - period)) for t, stack in zip(tags, sandwiches)))
+    # Preserve a previously usable exact-identity repeat. Partial coverage is
+    # a fallback when exact matching leaves no observed repeat to fit, not a
+    # reason to change a working structure's default templates or transform.
+    strict_period = next((p for p in range(1, depth + 1)
+                          if not (pure_anti and p % 2) and
+                          all(all(t[i] == t[i + p] for i in range(len(t) - p)) for t in tags)), depth + 1)
+    period = (strict_period if strict_period < depth else
+              next((p for p in range(1, depth + 1) if compatible(p)), depth + 1))
     axis = None
     if contact_vectors:
         _, _, vt = np.linalg.svd(np.array(contact_vectors), full_matrices=False)
@@ -2215,6 +2543,452 @@ def _expansion_repeat_pattern(chains, sandwiches):
                 antiparallel=bool(contact_vectors))
 
 
+def _single_unit_axis(points):
+    """Estimate a layer normal from its C-alpha covariance, not a repeat fit.
+
+    The two largest principal spreads define the broadest PCA projection;
+    their normal is the smallest-eigenvalue eigenvector. Eigenvalues are
+    coordinate variances (A^2), not literal molecular projected areas.
+    """
+    import numpy as np
+    points = np.asarray(points, dtype=float)
+    if points.ndim != 2 or points.shape[1] != 3 or len(points) < 3 or not np.all(np.isfinite(points)):
+        raise StructureEditError('Estimating a single-unit axis needs at least three finite C-alpha coordinates.')
+    centered = points - points.mean(axis=0)
+    values, vectors = np.linalg.eigh(centered.T @ centered / len(points))
+    tolerance = max(1e-12, float(values[-1]) * 1e-6)
+    if values[1] <= tolerance or values[1] - values[0] <= tolerance:
+        raise StructureEditError('The single-unit shape has no unique plane normal. '
+                                 'Align the structure with Z and uncheck Compute Helical Axis.')
+    axis = vectors[:, 0]
+    # A single layer cannot establish polarity; choose a reproducible sign.
+    if axis[np.argmax(np.abs(axis))] < 0:
+        axis = -axis
+    return axis, np.maximum(values, 0.)
+
+
+def terminal_completion_supported(detection):
+    """Topology eligibility only; the expansion also validates the rigid fit."""
+    tracks = (detection or {}).get('protofilaments', [])
+    sizes = [t['units'] for t in tracks]
+    if not sizes or not all(t['complete'] and t['layers_per_unit'] == 1 for t in tracks):
+        return False
+    missing = max(sizes) - min(sizes)
+    established = (missing == 1 and min(sizes) >= 3 and
+                   all(t['orientation'] in ('parallel', 'antiparallel', 'mixed') for t in tracks))
+    short_parallel = (1 <= missing <= 2 and min(sizes) >= 2 and
+                      all(t['orientation'] == 'parallel' for t in tracks))
+    return established or short_parallel
+
+
+def _edit_clone(editor):
+    # Editing replaces output state; source tables are read-only. Keep reports
+    # independent so any failed staged operation leaves the caller untouched.
+    clone = object.__new__(StructureEditor)
+    clone.__dict__ = editor.__dict__.copy()
+    clone.report = deepcopy(editor.report)
+    clone.report['chain_copies'] = []
+    return clone
+
+
+def terminal_completion_messages(report):
+    completion = report.get('terminal_completion')
+    if not completion:
+        return []
+    lines = [f"Modeled terminal completion: added {completion['added_chain_units']} chain units to make every protofilament {completion['completed_units']} layers before expansion. Existing atoms were preserved.",
+             f"Completion orientation: {completion['orientation']}; measured repeat: {completion['repeat_units']} chain units."]
+    lines.extend(f"Protofilament #{a['protofilament']}: copied {a['source_chain']} to {a['added_chain']} at the {a['side']} end."
+                 for a in completion['additions'])
+    lines.extend(completion.get('placement_notes', []))
+    return lines
+
+
+def _expand_unequal_stacks(editor, sandwiches, layers_to_add, use_auto, manual_twist,
+                          manual_rise, water_z_limit, use_alt, use_computed_axis,
+                          label_generator, repeat_units, random_seed):
+    import numpy as np
+    ca = editor.ca_chains()
+    detection = detect_layers({c: ca[c] for s in sandwiches for c in s})
+    if (not terminal_completion_supported(detection) or
+            {tuple(s) for s in detection['sandwiches']} != {tuple(s) for s in sandwiches}):
+        raise StructureEditError('Automatic completion requires contiguous, ordered stacks with supported terminal deficits, '
+                                 'determined strand orientation and one physical layer per chain. Internal gaps and ambiguous stacks are not repaired.')
+    minimum, depth = min(map(len, sandwiches)), max(map(len, sandwiches))
+    common = [s[:minimum] for s in sandwiches]
+    period = _expansion_repeat_pattern(ca, common)['period']
+    if minimum <= period:
+        raise StructureEditError('Terminal completion needs an observed same-phase repeat in every protofilament.')
+    # Ask the established expander for both terminal candidates. Its source is
+    # still the whole assembly: the longer stacks' extra atoms are never cut.
+    probe = _edit_clone(editor)
+    repair_result = expand_structure_layers(probe, common, 2 * (depth - minimum), True, 0., 4.8,
+        water_z_limit, label_generator=label_generator, repeat_units=period)
+    geometry = probe.report['geometry']
+    rotation, translation = np.array(geometry['cycle_matrix']), np.array(geometry['cycle_vector'])
+    axis = np.array(geometry['axis'])
+    # Validate every observed pair, including the fifth chains omitted from
+    # the common-length fitting view. A pooled core may not hide a bad stack.
+    errors = []
+    for stack in sandwiches:
+        for i in range(len(stack) - period):
+            p, q = _repeat_coordinate_pairs(ca[stack[i]], ca[stack[i + period]])
+            fit = _fit_detection_core(p, q)
+            if fit is None:
+                raise StructureEditError('No stable repeat supports terminal completion.')
+            residual = np.linalg.norm(p @ rotation.T + translation - q, axis=1)[fit['mask']]
+            errors.append(float(np.sqrt(np.mean(residual ** 2))))
+    if max(errors) > 1.5:
+        raise StructureEditError('The protofilaments do not share a consistent measured repeat; terminal completion was not applied.')
+    centers = {c: np.mean([r['coord'] for r in ca[c]], axis=0) for c in ca}
+    midplane = float(np.median([np.mean([centers[c] @ axis for c in s])
+                               for s in sandwiches if len(s) == depth]))
+    candidates = defaultdict(dict)
+    for choice, group in zip(probe.report['geometry']['template_choices'], probe.groups[1:]):
+        dest = choice['destination_unit']
+        for pf, (donor, copied) in enumerate(zip(choice['source_chains'], choice['destination_chains'])):
+            if len(sandwiches[pf]) == depth:
+                continue
+            candidates[pf][dest] = (dest, donor, copied, group)
+    choices = {}
+    placement_notes = []
+    for pf, options in candidates.items():
+        size = len(sandwiches[pf])
+        missing = depth - size
+        alternatives = []
+        for lower in range(missing + 1):
+            destinations = list(range(-lower, 0)) + list(range(size, size + missing - lower))
+            if not all(i in options for i in destinations):
+                continue
+            chosen = [options[i] for i in destinations]
+            extra_centers = [g['rotation'] @ centers[donor] + g['translation']
+                             for _, donor, _, g in chosen]
+            midpoint = (sum(centers[c] @ axis for c in sandwiches[pf]) +
+                        sum(center @ axis for center in extra_centers)) / depth
+            alternatives.append((abs(float(midpoint) - midplane), tuple(destinations), chosen))
+        if not alternatives:
+            raise StructureEditError('No contiguous terminal copies can complete the short stack.')
+        alternatives.sort(key=lambda item: item[:2])
+        selected = alternatives[0]
+        if minimum < 3 or depth - minimum > 1:
+            # Staggered protofilaments can have equally plausible terminations.
+            # Prefer balanced ends among equivalent midplane offsets; disclose
+            # that boundary choice instead of implying a unique reconstruction.
+            close = [item for item in alternatives if item[0] - selected[0] < .25]
+            if len(close) > 1:
+                selected = min(close, key=lambda item: (abs(sum(i < 0 for i in item[1]) -
+                                                            sum(i >= 0 for i in item[1])), item[1]))
+                placement_notes.append(f'Protofilament #{pf + 1}: several terminal placements fit the measured repeat; used balanced ends with a consistent lower-end tie break. These are modeled additions, not uniquely determined missing coordinates.')
+        choices[pf] = selected[2]
+    attached = editor.covalent_residue_owners()
+    copies = [dict(chains={c: c for c in editor.chains})]
+    completed = [list(s) for s in sandwiches]
+    instances = {(pf, i): c for pf, s in enumerate(sandwiches) for i, c in enumerate(s)}
+    additions = []
+    for pf, chosen in sorted(choices.items()):
+        completed[pf] = ([copied for dest, _, copied, _ in chosen if dest < 0] + sandwiches[pf] +
+                         [copied for dest, _, copied, _ in chosen if dest >= 0])
+        for dest, donor, copied, group in chosen:
+            rows = [r for r in editor.atoms if
+                    (r['auth_asym_id'] == donor and r['label_asym_id'] in editor.protein_labels)
+                    or attached.get(_residue_key(r)) == donor]
+            mapping = {c: group['chains'][c] for c in dict.fromkeys(r['auth_asym_id'] for r in rows)}
+            copies.append(dict(chains=mapping, atom_ids={r['id'] for r in rows},
+                               matrix=group['rotation'], vector=group['translation']))
+            instances[pf, dest] = copied
+            additions.append(dict(protofilament=pf + 1, side='lower' if dest < 0 else 'upper',
+                                  source_chain=donor, added_chain=copied))
+    # Reuse only companion candidates on the chosen terminal side of a short
+    # stack, and only if completing that stack adds a whole occupancy period.
+    owners = editor.associated_residues({c for s in sandwiches for c in s}, water_z_limit, axis)
+    locations = {c: pf for pf, s in enumerate(sandwiches) for c in s}
+    ligand_groups = probe.groups[1 + len(probe.report['geometry']['template_choices']):]
+    for item, group in zip(probe.report['ligand_copies'], ligand_groups):
+        owner = owners.get(tuple(item['residue']))
+        pf = locations.get(owner)
+        ligand_period = item['period_units']
+        if (pf not in choices or item['destination_unit'] not in {c[0] for c in choices[pf]} or
+                depth // ligand_period == minimum // ligand_period):
+            continue
+        copies.append(dict(chains=group['chains'], atom_ids=set(group['ids']),
+                           matrix=group['rotation'], vector=group['translation']))
+    repaired = _edit_clone(editor)
+    repaired.apply_copies(copies)
+    repaired.propagate_layer_bonds(sandwiches, instances, period)
+    repaired.propagate_layer_sheets(sandwiches, instances, period)
+    buffer = StructureBuffer('terminal-completion.cif')
+    repaired.write(buffer, format='cif')
+    staged = StructureEditor(buffer)
+    checked = detect_layers(staged.ca_chains())
+    expected = {frozenset(s) for s in completed}
+    original_orientation = {frozenset(t['chains']): t['orientation'] for t in detection['protofilaments']}
+    expected_orientation = {frozenset(new): original_orientation[frozenset(old)]
+                            for old, new in zip(sandwiches, completed)}
+    if (not checked['complete'] or checked['detected_units'] != depth or
+            {frozenset(s) for s in checked['sandwiches']} != expected or
+            any(t['orientation'] != expected_orientation.get(frozenset(t['chains']))
+                for t in checked['protofilaments'])):
+        raise StructureEditError('Modeled terminal copies did not produce the expected complete stacks; no edit applied.')
+    # Reject overlap with another scaffold, not just errors in our own track.
+    repaired_ca = staged.ca_chains()
+    if not _expansion_repeat_pattern(repaired_ca, completed)['compatible'](period):
+        raise StructureEditError('Terminal completion changed the source orientation motif; no edit applied.')
+    new_ids = {a['added_chain'] for a in additions}
+    for cid in new_ids:
+        p = np.array([r['coord'] for r in repaired_ca[cid]])
+        q = np.array([r['coord'] for c, rows in repaired_ca.items() if c != cid for r in rows])
+        if np.any(np.sum((p[:, None, :] - q[None, :, :]) ** 2, axis=2) < 2.5 ** 2):
+            raise StructureEditError('A modeled terminal chain overlaps the protein scaffold; no edit applied.')
+    # Continue from the completed assembly, preserving the requested expansion
+    # options. Completion itself always uses the measured source repeat.
+    if layers_to_add:
+        result = expand_structure_layers(staged, completed, layers_to_add, use_auto, manual_twist,
+            manual_rise, water_z_limit, use_alt, use_computed_axis, label_generator,
+            repeat_units, random_seed)
+    else:
+        staged.apply_copies([dict(chains={c: c for c in staged.chains})])
+        result = repair_result
+        staged.report['geometry'] = deepcopy(geometry)
+        staged.report['geometry']['template_choices'] = []
+    # Compose both stages back onto original atoms. Donor/style mappings and
+    # metadata must refer to original chains, never to temporary repair chains.
+    composed = []
+    for final_group in staged.groups:
+        for first_group in repaired.groups:
+            ids = {old: middle for old, middle in first_group['ids'].items()
+                   if middle in final_group['ids']}
+            if not ids:
+                continue
+            source_chains = {r['auth_asym_id'] for r in first_group['rows'] if r['id'] in ids}
+            mapping = {c: final_group['chains'][first_group['chains'][c]] for c in source_chains}
+            composed.append(dict(chains=mapping, atom_ids=set(ids),
+                matrix=final_group['rotation'] @ first_group['rotation'],
+                vector=final_group['rotation'] @ first_group['translation'] + final_group['translation']))
+    final = _edit_clone(editor)
+    final.report['operation'] = 'complete terminal layers and expand'
+    final.report['geometry'] = deepcopy(staged.report['geometry'])
+    for field in ('automatic_fit', 'ligand_repeats', 'ligand_copies'):
+        if field in staged.report:
+            final.report[field] = deepcopy(staged.report[field])
+    final.report['warnings'] = list(dict.fromkeys(final.report['warnings'] + repaired.report['warnings'] + staged.report['warnings']))
+    final.report['terminal_completion'] = dict(original_lengths=[len(s) for s in sandwiches],
+        completed_units=depth, added_chain_units=len(additions), additions=additions,
+        repeat_units=period, orientation=detection['orientation'],
+        method='measured same-phase repeat; terminal side minimizes offset from the longer stacks midplane',
+        modeled=True, pair_core_rmsds=errors, geometry=deepcopy(geometry))
+    if placement_notes:
+        final.report['terminal_completion']['placement_notes'] = placement_notes
+    final.apply_copies(composed)
+    _check_new_ca_overlaps(final, reject=not use_auto)
+    # Align source indices to their positions in the completed five-layer view.
+    padded = [[None] * sum(c[0] < 0 for c in choices.get(pf, [])) + list(s)
+              for pf, s in enumerate(sandwiches)]
+    final_instances = {(pf, i): c for pf, s in enumerate(completed) for i, c in enumerate(s)}
+    for choice in staged.report['geometry']['template_choices']:
+        for pf, c in enumerate(choice['destination_chains']):
+            final_instances[pf, choice['destination_unit']] = c
+    final.propagate_layer_bonds(padded, final_instances, period)
+    final.propagate_layer_sheets(padded, final_instances, period)
+    source = {_atom_key(r): r for r in editor.atoms}
+    retained = {_atom_key(r): r for r in final.output_atoms if _atom_key(r) in source}
+    if retained.keys() != source.keys() or any(retained[k][f] != row[f]
+            for k, row in source.items() for f in ('Cartn_x', 'Cartn_y', 'Cartn_z')):
+        raise StructureEditError('Terminal completion changed an existing atom; no edit applied.')
+    final.report['source_preservation'] = dict(atoms=len(source), coordinates='unchanged')
+    editor.__dict__.update(final.__dict__)
+    return result
+
+
+def _rotation_about_axis(p, q, axis):
+    """Least-squares proper rotation with a prescribed unit axis."""
+    _, np = _structure_dependencies()
+    pp, qq = p - p.mean(0), q - q.mean(0)
+    pp -= (pp @ axis)[:, None] * axis
+    qq -= (qq @ axis)[:, None] * axis
+    angle = math.atan2(float(np.sum(np.cross(pp, qq) @ axis)), float(np.sum(pp * qq)))
+    k = np.array([[0, -axis[2], axis[1]], [axis[2], 0, -axis[0]], [-axis[1], axis[0], 0]])
+    return np.eye(3) + math.sin(angle) * k + (1 - math.cos(angle)) * (k @ k)
+
+
+def _check_new_ca_overlaps(editor, *, reject=False):
+    """Diagnose near-coincident C-alpha atoms across newly placed copies.
+
+    This small-distance check is a geometry sanity check, not an energy model or
+    a substitute for all-atom refinement/validation. Alternate conformers of the
+    same residue and independent ensemble models are never compared.
+    """
+    threshold = MIN_NEW_CA_SEPARATION
+    original = {_atom_key(row) for row in editor.atoms}
+    protein_labels = {new for group in editor.groups for old, new in group['labels'].items()
+                      if old in editor.protein_labels}
+    copy_groups = {atom_id: index for index, group in enumerate(editor.groups)
+                   for atom_id in group['ids'].values()}
+    buckets = defaultdict(list)
+    offsets = tuple(product((-1, 0, 1), repeat=3))
+    examined = 0
+    clashes = []
+    clash_count = 0
+    for row in editor.output_atoms:
+        if row['label_atom_id'] != 'CA' or row['label_asym_id'] not in protein_labels:
+            continue
+        xyz = tuple(float(row[f]) for f in ('Cartn_x', 'Cartn_y', 'Cartn_z'))
+        cell = tuple(math.floor(x / threshold) for x in xyz)
+        model = str(row['pdbx_PDB_model_num'])
+        is_new = _atom_key(row) not in original
+        residue = _residue_key(row)
+        copy_group = copy_groups[row['id']]
+        for dx, dy, dz in offsets:
+            for other, other_new, other_residue, other_group in buckets.get((model, cell[0]+dx, cell[1]+dy, cell[2]+dz), ()):
+                if ((is_new or other_new) and copy_group != other_group
+                        and residue[0] != other_residue[0]):
+                    distance2 = sum((a-b)**2 for a, b in zip(xyz, other))
+                    if distance2 < threshold**2:
+                        clash_count += 1
+                        if len(clashes) < 10:
+                            clashes.append(dict(residue=list(residue), other_residue=list(other_residue),
+                                                distance_angstrom=math.sqrt(distance2)))
+        buckets[(model,) + cell].append((xyz, is_new, residue, copy_group))
+        examined += 1
+    editor.report['overlap_check'] = dict(ca_atoms=examined, minimum_new_separation_angstrom=threshold,
+                                        close_pairs=clash_count, examples=clashes,
+                                        scope='C-alpha contacts across new copies only; not all-atom clash validation')
+    if clash_count:
+        message = (f'Expansion introduces C-alpha atoms less than {threshold:g} Å apart '
+                   f'across placed copies ({clash_count} pairs). Review repeat geometry and source contacts.')
+        if reject:
+            raise StructureEditError(message + ' Manual expansion was not applied.')
+        # Flexible experimental templates may have poor terminal contacts. Report
+        # these explicitly without removing the existing automatic-edit workflow.
+        editor.report['warnings'].append(message)
+
+
+def _fit_repeat_transform(ca, stacks, period, axis, centers, *, computed_axis, randomize) -> RepeatTransform:
+    """Fit a cycle to stable C-alpha cores and report support for every pair.
+
+    ``period`` counts chain units. Returned twist/rise are per chain unit, not
+    necessarily per physical layer. The input axis is an observed repeat direction;
+    a resolved unconstrained rotation may supply its own screw axis instead.
+    """
+    _, np = _structure_dependencies()
+    sandwiches, step, depth = stacks, period, len(stacks[0])
+    use_computed_axis = computed_axis
+    axis = axis.copy()
+    observed_axis = axis.copy()
+    if depth <= step:
+        raise StructureEditError(f'Automatic fitting for a {step}-unit repeat needs at least {step + 1} source chain units. '
+                                 'Load another repeat or enter manual twist/rise.')
+    source, target, pair_ranges, repeat_directions = [], [], [], []
+    for s in sandwiches:
+        for i in range(depth - step):
+            pair_p, pair_q = _repeat_coordinate_pairs(ca[s[i]], ca[s[i + step]])
+            pair_ranges.append((len(source), len(source) + len(pair_p)))
+            source.extend(pair_p)
+            target.extend(pair_q)
+            if use_computed_axis and (step > 1 or randomize) and len(pair_p) >= 6:
+                fit = _fit_detection_core(pair_p, pair_q)
+                if fit is None or fit['rmsd'] > 1.5:
+                    raise StructureEditError('No stable core between equivalent repeat positions.')
+                repeat_directions.append((pair_q - pair_p)[fit['mask']].mean(0))
+    p, q = np.asarray(source), np.asarray(target)
+    full_p, full_q = p, q
+    total_fit_atoms = len(p)
+    # Fit the stable core; copy complete chains, including their flexible regions.
+    if use_computed_axis and len(p) >= 6:
+        core_fit = _fit_detection_core(p, q)
+        if core_fit is None or core_fit['rmsd'] > 1.0:
+            raise StructureEditError('No consistent stable core for automatic expansion.')
+        p, q = p[core_fit['mask']], q[core_fit['mask']]
+    pc, qc = p.mean(axis=0), q.mean(axis=0)
+    if len(p) < 3 or np.linalg.matrix_rank(p - pc) < 2:
+        raise StructureEditError("At least three noncollinear matched C-alpha atoms are needed.")
+    axis_constrained = False
+    axis_constraint_reason = None
+    rigid_cycle_max_error = None
+    if use_computed_axis:
+        # A rigid cycle spanning several chain units is still one proper fit.
+        # Mean atom displacement is not its screw axis: off-axis atoms also
+        # move tangentially. Flexible cycles retain their directional model;
+        # unresolved near-zero rotations use the observed repeat direction.
+        u, _, vt = np.linalg.svd((p - pc).T @ (q - qc))
+        fix = np.eye(3)
+        fix[2, 2] = np.linalg.det(vt.T @ u.T)
+        rotation = vt.T @ fix @ u.T
+        free_translation = qc - rotation @ pc
+        rigid_cycle_max_error = float(np.linalg.norm(full_p @ rotation.T + free_translation - full_q, axis=1).max())
+        cycle_angle = math.degrees(math.acos(float(np.clip((np.trace(rotation)-1)/2, -1, 1))))
+        if (step > 1 or randomize) and rigid_cycle_max_error > RIGID_REPEAT_COORDINATE_TOLERANCE:
+            # Flexible multi-phase templates retain the established directional
+            # model. An exact rigid cycle does not need that extra assumption:
+            # require EVERY matched CA, not just a trimmed core, to agree within
+            # coordinate-rounding tolerance before using its unconstrained axis.
+            if repeat_directions:
+                axis = np.mean(repeat_directions, axis=0)
+                norm = np.linalg.norm(axis)
+                if norm < 1e-8:
+                    raise StructureEditError('Same-phase repeat directions cancel; check the ordered stacks.')
+                axis /= norm
+            rotation = _rotation_about_axis(p, q, axis)
+            axis_constrained = True
+            axis_constraint_reason = 'periodic or randomized repeat'
+        elif cycle_angle < MIN_RESOLVED_ROTATION_DEGREES:
+            # Near identity, a rotation eigenvector is mostly coordinate noise.
+            # Keep the measured repeat axis and refit around that direction.
+            rotation = _rotation_about_axis(p, q, axis)
+            axis_constrained = True
+            axis_constraint_reason = 'near-zero cycle rotation'
+        else:
+            vals, vecs = np.linalg.eig(rotation)
+            axis = np.real(vecs[:, np.argmin(abs(vals - 1))])
+            axis /= np.linalg.norm(axis)
+            if np.dot(axis, centers[-1] - centers[0]) < 0:
+                axis = -axis
+    else:
+        pp, qq = p - pc, q - qc
+        angle = math.atan2(np.sum(pp[:, 0] * qq[:, 1] - pp[:, 1] * qq[:, 0]),
+                           np.sum(pp[:, 0] * qq[:, 0] + pp[:, 1] * qq[:, 1]))
+        rotation = np.array([[math.cos(angle), -math.sin(angle), 0], [math.sin(angle), math.cos(angle), 0], [0, 0, 1]])
+    translation = qc - rotation @ pc
+    skew = np.array([rotation[2, 1] - rotation[1, 2], rotation[0, 2] - rotation[2, 0], rotation[1, 0] - rotation[0, 1]]) / 2
+    twist = math.degrees(math.atan2(float(np.dot(skew, axis)), float(np.clip((np.trace(rotation) - 1) / 2, -1, 1)))) / step
+    rise = float(np.dot(translation, axis)) / step
+    rmsd = float(np.sqrt(np.mean(np.sum((p @ rotation.T + translation - q) ** 2, axis=1))))
+    # A pooled trimmed fit must not discard an entire protein/phase.
+    errors = np.linalg.norm(full_p @ rotation.T + translation - full_q, axis=1)
+    phase_errors = []
+    for first, last in pair_ranges:
+        pair_fit = _fit_detection_core(full_p[first:last], full_q[first:last])
+        mask = pair_fit['mask'] if pair_fit is not None else np.arange(last - first)
+        core_error = float(np.sqrt(np.mean(errors[first:last][mask] ** 2)))
+        phase_errors.append(core_error)
+        if core_error > MAX_REPEAT_CORE_RMSD and (step > 1 or randomize):
+            raise StructureEditError('The source units do not share a consistent repeat transform in every phase; choose a different period or manual parameters.')
+    diagnostics = {'method': 'stable-core proper rigid fit' if use_computed_axis else 'Z-axis fit',
+                                    'matched_ca_atoms': total_fit_atoms, 'fitted_ca_atoms': len(p),
+                                    'core_rmsd': rmsd, 'period_units': step,
+                                    'axis_constrained_to_repeats': axis_constrained,
+                                    'axis_constraint_reason': axis_constraint_reason,
+                                    'minimum_resolved_cycle_angle_degrees': MIN_RESOLVED_ROTATION_DEGREES}
+    diagnostics['unconstrained_cycle_max_error_angstrom'] = rigid_cycle_max_error
+    diagnostics['rigid_cycle_coordinate_tolerance_angstrom'] = RIGID_REPEAT_COORDINATE_TOLERANCE
+    diagnostics['pair_core_rmsds'] = phase_errors
+
+    diagnostics['axis_repeat_alignment'] = float(abs(np.dot(axis, observed_axis)))
+    diagnostics['warnings'] = []
+    if axis_constraint_reason == 'near-zero cycle rotation':
+        diagnostics['warnings'].append(
+            'Near-zero rotation: the axis is constrained to the observed repeat direction. '
+            'The tiny fitted rotation does not independently determine a screw axis.')
+    if max(phase_errors, default=0) > MAX_REPEAT_CORE_RMSD:
+        diagnostics['warnings'].append(
+            f'At least one source pair has stable-core RMSD above {MAX_REPEAT_CORE_RMSD:g} Å '
+            'under the shared transform. Flexible boundaries may not follow an ideal repeat; '
+            'review the per-pair RMSDs and extrapolated contacts.')
+    if computed_axis and diagnostics['axis_repeat_alignment'] < .5:
+        diagnostics['warnings'].append(
+            'The fitted screw axis differs by more than 60 degrees from the observed repeat direction. '
+            'Axis and rise may be unreliable despite a small coordinate RMSD; review the source stacks.')
+    return RepeatTransform(rotation, translation, axis, twist, rise, rmsd, diagnostics)
+
+
 def expand_structure_layers(editor, sandwiches, layers_to_add, use_auto, manual_twist,
                             manual_rise, water_z_limit=4.0, use_alt=False,
                             use_computed_axis=True, label_generator=None,
@@ -2223,16 +2997,20 @@ def expand_structure_layers(editor, sandwiches, layers_to_add, use_auto, manual_
     # repeat_units selects the cycle length; zero or negative values sample compatible templates.
     # Twist and rise are per chain unit, even for chains spanning several layers.
     _, np = _structure_dependencies()
-    if not isinstance(layers_to_add, int) or layers_to_add <= 0:
+    unequal = bool(sandwiches) and len({len(s) for s in sandwiches}) > 1
+    if not isinstance(layers_to_add, int) or layers_to_add < 0 or (layers_to_add == 0 and not unequal):
         raise StructureEditError("Number of added layers must be a positive integer.")
-    if not sandwiches or len({len(s) for s in sandwiches}) != 1 or not sandwiches[0]:
-        raise StructureEditError("Expansion requires equally populated, ordered protofilaments.")
+    if not sandwiches or any(not s for s in sandwiches):
+        raise StructureEditError("Expansion requires nonempty, ordered protofilaments.")
     core = [c for s in sandwiches for c in s]
     if len(set(core)) != len(core):
         raise StructureEditError("A chain occurs in more than one protofilament/layer.")
     ca = editor.ca_chains()
     if set(core) - set(ca):
         raise StructureEditError("Some selected chains have no polymer C-alpha atoms.")
+    if unequal:
+        return _expand_unequal_stacks(editor, sandwiches, layers_to_add, use_auto, manual_twist,
+            manual_rise, water_z_limit, use_alt, use_computed_axis, label_generator, repeat_units, random_seed)
     depth = len(sandwiches[0])
     pattern = _expansion_repeat_pattern(ca, sandwiches)
     if repeat_units is None:
@@ -2258,7 +3036,13 @@ def expand_structure_layers(editor, sandwiches, layers_to_add, use_auto, manual_
     centers = np.array([np.mean([r["coord"] for s in sandwiches for r in ca[s[i]]], axis=0) for i in range(depth)])
     center = centers.mean(axis=0)
     axis = np.array([0., 0., 1.])
+    axis_source = 'global Z'
+    axis_eigenvalues = None
+    if use_computed_axis and depth == 1:
+        axis, axis_eigenvalues = _single_unit_axis([r['coord'] for c in core for r in ca[c]])
+        axis_source = 'single-unit C-alpha PCA plane normal (shape estimate)'
     if use_computed_axis and depth >= 2:
+        axis_source = 'source repeats'
         # Same-phase displacements avoid the transverse stagger between A/B.
         repeated = centers[step:] - centers[:-step]
         axis_points = repeated if step > 1 and len(repeated) else centers - center
@@ -2272,87 +3056,13 @@ def expand_structure_layers(editor, sandwiches, layers_to_add, use_auto, manual_
             axis = -axis
     rmsd = None
     if use_auto:
-        if depth <= step:
-            raise StructureEditError(f'Automatic fitting for a {step}-unit repeat needs at least {step + 1} source chain units. '
-                                     'Load another repeat or enter manual twist/rise.')
-        source, target, pair_ranges, repeat_directions = [], [], [], []
-        for s in sandwiches:
-            for i in range(depth - step):
-                a = {r["key"]: r["coord"] for r in ca[s[i]]}
-                b = {r["key"]: r["coord"] for r in ca[s[i + step]]}
-                pair_p, pair_q = _repeat_coordinate_pairs(ca[s[i]], ca[s[i + step]])
-                pair_ranges.append((len(source), len(source) + len(pair_p)))
-                source.extend(pair_p)
-                target.extend(pair_q)
-                if use_computed_axis and (step > 1 or randomize) and len(pair_p) >= 6:
-                    fit = _fit_detection_core(pair_p, pair_q)
-                    if fit is None or fit['rmsd'] > 1.5:
-                        raise StructureEditError('No stable core between equivalent repeat positions.')
-                    repeat_directions.append((pair_q - pair_p)[fit['mask']].mean(0))
-        p, q = np.asarray(source), np.asarray(target)
-        full_p, full_q = p, q
-        if repeat_directions:
-            axis = np.mean(repeat_directions, axis=0)
-            norm = np.linalg.norm(axis)
-            if norm < 1e-8:
-                raise StructureEditError('Same-phase repeat directions cancel; check the ordered stacks.')
-            axis /= norm
-        total_fit_atoms = len(p)
-        # Fit the stable core; copy complete chains, including their flexible regions.
-        if use_computed_axis and len(p) >= 6:
-            core_fit = _fit_detection_core(p, q)
-            if core_fit is None or core_fit['rmsd'] > 1.0:
-                raise StructureEditError('No consistent stable core for automatic expansion.')
-            p, q = p[core_fit['mask']], q[core_fit['mask']]
-        pc, qc = p.mean(axis=0), q.mean(axis=0)
-        if len(p) < 3 or np.linalg.matrix_rank(p - pc) < 2:
-            raise StructureEditError("At least three noncollinear matched C-alpha atoms are needed.")
-        if use_computed_axis and (step > 1 or randomize):
-            # Constrain periodic fits to the repeat direction to avoid unstable NMR screw axes.
-            pp, qq = p - pc, q - qc
-            pp -= (pp @ axis)[:, None] * axis
-            qq -= (qq @ axis)[:, None] * axis
-            angle = math.atan2(float(np.sum(np.cross(pp, qq) @ axis)), float(np.sum(pp * qq)))
-            k = np.array([[0, -axis[2], axis[1]], [axis[2], 0, -axis[0]], [-axis[1], axis[0], 0]])
-            rotation = np.eye(3) + math.sin(angle) * k + (1 - math.cos(angle)) * (k @ k)
-        elif use_computed_axis:
-            u, _, vt = np.linalg.svd((p - pc).T @ (q - qc))
-            fix = np.eye(3)
-            fix[2, 2] = np.linalg.det(vt.T @ u.T)
-            rotation = vt.T @ fix @ u.T
-            vals, vecs = np.linalg.eig(rotation)
-            if not np.allclose(rotation, np.eye(3), atol=1e-7):
-                axis = np.real(vecs[:, np.argmin(abs(vals - 1))])
-                axis /= np.linalg.norm(axis)
-                if np.dot(axis, centers[-1] - centers[0]) < 0:
-                    axis = -axis
-        else:
-            pp, qq = p - pc, q - qc
-            angle = math.atan2(np.sum(pp[:, 0] * qq[:, 1] - pp[:, 1] * qq[:, 0]),
-                               np.sum(pp[:, 0] * qq[:, 0] + pp[:, 1] * qq[:, 1]))
-            rotation = np.array([[math.cos(angle), -math.sin(angle), 0], [math.sin(angle), math.cos(angle), 0], [0, 0, 1]])
-        translation = qc - rotation @ pc
-        skew = np.array([rotation[2, 1] - rotation[1, 2], rotation[0, 2] - rotation[2, 0], rotation[1, 0] - rotation[0, 1]]) / 2
-        twist = math.degrees(math.atan2(float(np.dot(skew, axis)), float(np.clip((np.trace(rotation) - 1) / 2, -1, 1)))) / step
-        rise = float(np.dot(translation, axis)) / step
-        rmsd = float(np.sqrt(np.mean(np.sum((p @ rotation.T + translation - q) ** 2, axis=1))))
-        if step > 1 or randomize:
-            # A pooled trimmed fit must not discard an entire protein/phase.
-            errors = np.linalg.norm(full_p @ rotation.T + translation - full_q, axis=1)
-            phase_errors = []
-            for first, last in pair_ranges:
-                pair_fit = _fit_detection_core(full_p[first:last], full_q[first:last])
-                mask = pair_fit['mask'] if pair_fit is not None else np.arange(last - first)
-                core_error = float(np.sqrt(np.mean(errors[first:last][mask] ** 2)))
-                phase_errors.append(core_error)
-                if core_error > 1.5:
-                    raise StructureEditError('The source units do not share a consistent repeat transform in every phase; choose a different period or manual parameters.')
-        editor.report['automatic_fit'] = {'method': 'stable-core proper rigid fit' if use_computed_axis else 'Z-axis fit',
-                                        'matched_ca_atoms': total_fit_atoms, 'fitted_ca_atoms': len(p),
-                                        'core_rmsd': rmsd, 'period_units': step,
-                                        'axis_constrained_to_repeats': bool(use_computed_axis and (step > 1 or randomize))}
-        if step > 1 or randomize:
-            editor.report['automatic_fit']['pair_core_rmsds'] = phase_errors
+        rotation, translation, axis, twist, rise, rmsd, fit_report = _fit_repeat_transform(
+            ca, sandwiches, step, axis, centers, computed_axis=use_computed_axis, randomize=randomize)
+        editor.report['automatic_fit'] = fit_report
+        editor.report['warnings'].extend(fit_report['warnings'])
+        if use_computed_axis:
+            axis_source = ('source repeats; ' + fit_report['axis_constraint_reason']
+                           if fit_report['axis_constrained_to_repeats'] else 'stable-core screw axis')
     else:
         twist, rise = float(manual_twist), float(manual_rise)
         if not math.isfinite(twist) or not math.isfinite(rise) or abs(rise) < 1e-8:
@@ -2366,8 +3076,11 @@ def expand_structure_layers(editor, sandwiches, layers_to_add, use_auto, manual_
     attached_residues = editor.covalent_residue_owners()
     ligand_sites = editor.associated_residue_repeats(sandwiches, axis, rise, water_z_limit)
     for site in ligand_sites:
-        site['residues'] = [r for r in site['residues'] if not any(k in attached_residues for k in r['keys'])]
-    ligand_sites = [s for s in ligand_sites if s['residues']]
+        site['donors'] = [r for r in site['residues'] if not any(k in attached_residues for k in r['keys'])]
+        site['attached_copies'] = 0
+        site['occupied'] = {r['layer'] for r in site['residues']}
+    attached_sites = {k: (site, r) for site in ligand_sites for r in site['residues']
+                      for k in r['keys'] if k in attached_residues}
     used = set(editor.chains)
     next_index = 0
     def allocate():
@@ -2454,37 +3167,88 @@ def expand_structure_layers(editor, sandwiches, layers_to_add, use_auto, manual_
                                      destination_chains=[instances[pf, dest] for pf in range(len(sandwiches))]))
         copies.append({"chains": mapping, "atom_ids": {r["id"] for r in selected},
                        "matrix": transformed[:3, :3], "vector": transformed[:3, 3]})
+        copied_attachments = set()
+        for row in selected:
+            key = _residue_key(row)
+            if key in attached_sites:
+                site, residue = attached_sites[key]
+                if residue['key'] not in copied_attachments:
+                    copied_attachments.add(residue['key'])
+                    site['attached_copies'] += 1
+                    site['occupied'].add(residue['layer'] + dest - ref)
     ligand_copies = []
     homogeneous = np.eye(4)
     homogeneous[:3, :3], homogeneous[:3, 3] = rotation, translation
+    # Include retained ligands and protein-attached copies in duplicate checks.
+    placed = defaultdict(list)
     for site in ligand_sites:
+        for residue in site['residues']:
+            placed[site['identity']].append(residue['xyz'])
+            if any(k in attached_residues for k in residue['keys']):
+                atom_ids = {r['id'] for r in editor.atoms if _residue_key(r) in residue['keys']}
+                for spec in copies[1:]:
+                    if atom_ids.issubset(spec['atom_ids']):
+                        placed[site['identity']].append(residue['xyz'] @ spec['matrix'].T + spec['vector'])
+    for site in ligand_sites:
+        if not site['donors']:
+            continue
         period = site['period']
-        count = (depth + layers_to_add) // period - depth // period
+        count = max(0, (depth + layers_to_add) // period - depth // period - site['attached_copies'])
         candidates = []
-        occupied = {r['layer'] for r in site['residues']}
-        for dest in range(-bottom, depth + top):
+        occupied = site['occupied']
+        bounds = range(-bottom, depth + top)
+        if site['terminal_track']:
+            first = min(r['layer'] for r in site['residues'])
+            last = max(r['layer'] for r in site['residues'])
+            bounds = list(range(first - bottom, first)) + list(range(last + 1, last + top + 1))
+        for dest in bounds:
             if dest in occupied:
                 continue
-            donors = [r for r in site['residues'] if (dest - r['layer']) % period == 0 and
+            donors = [r for r in site['donors'] if (dest - r['layer']) % period == 0 and
                       (dest - r['layer']) % step == 0]
             if donors:
                 donor = min(donors, key=lambda r: abs(dest - r['layer']))
                 candidates.append((dest, donor))
         midpoint = (depth + top - bottom - 1) / 2
         candidates.sort(key=lambda item: (abs(item[0] - midpoint), item[0]))
-        for dest, donor in candidates[:count]:
+        added = 0
+        overlaps = 0
+        for dest, donor in candidates:
+            if added >= count:
+                break
             selected = [r for r in editor.atoms if _residue_key(r) in donor['keys']]
-            transformed = np.linalg.matrix_power(homogeneous, (dest - donor['layer']) // step)
-            mapping = {donor['key'][0]: allocate()}
+            # matrix_power(H, 1) can return H itself. Keep each copy independent
+            # so a per-copy change can never corrupt the shared screw transform.
+            transformed = np.linalg.matrix_power(homogeneous, (dest - donor['layer']) // step).copy()
+            # A ligand's entire pose must follow its protein repeat. Freezing
+            # its orientation while rotating its center changes pocket contacts,
+            # even when the deposited ligand copies happen to be parallel.
+            xyz = donor['xyz'] @ transformed[:3, :3].T + transformed[:3, 3]
+            if len(xyz) >= 6 and any(p.shape == xyz.shape and
+                    np.linalg.norm(xyz.mean(0) - p.mean(0)) < min(2., .4 * abs(rise)) and
+                    np.sqrt(np.mean(np.sum((xyz - p) ** 2, axis=1))) < min(2., .4 * abs(rise))
+                    for p in placed[site['identity']]):
+                editor.report['warnings'].append('Skipped an overlapping ligand copy of ' + site['identity'][0])
+                overlaps += 1
+                continue
+            placed[site['identity']].append(xyz)
+            mapping = {chain: allocate() for chain in dict.fromkeys(r['auth_asym_id'] for r in selected)}
             copies.append(dict(chains=mapping, atom_ids={r['id'] for r in selected},
                                matrix=transformed[:3, :3], vector=transformed[:3, 3]))
             ligand_copies.append(dict(residue=list(donor['key']), source_unit=donor['layer'],
-                                      destination_unit=dest, period_units=period))
+                                      destination_unit=dest, period_units=period,
+                                      orientation='protein screw'))
+            added += 1
+        if overlaps and added < count:
+            raise StructureEditError('Ligand repeat sites propose overlapping copies of ' + site['identity'][0] +
+                                     '; cannot complete expansion without changing the inferred occupancy. No edit applied.')
     editor.report['ligand_repeats'] = [dict(component=s['identity'][0], period_units=s['period'],
                                           source_residues=[list(r['key']) for r in s['residues']]) for s in ligand_sites]
     editor.report['ligand_copies'] = ligand_copies
     editor.report["operation"] = "expand layers"
     editor.report["geometry"] = {"twist_degrees": twist, "rise_angstrom": rise, "axis": axis.tolist(),
+                                 "axis_source": axis_source,
+                                 "axis_pca_variances_angstrom2": axis_eigenvalues.tolist() if axis_eigenvalues is not None else None,
                                  "fit_rmsd_angstrom": rmsd, "alternating": step > 1,
                                  "repeat_units": repeat_units, "transform_period_units": step,
                                  "random_seed": random_seed if randomize else None,
@@ -2492,6 +3256,7 @@ def expand_structure_layers(editor, sandwiches, layers_to_add, use_auto, manual_
                                  "cycle_matrix": rotation.tolist(), "cycle_vector": translation.tolist(),
                                  "manual_axis_point": center.tolist() if not use_auto else None}
     editor.apply_copies(copies)
+    _check_new_ca_overlaps(editor, reject=not use_auto)
     editor.propagate_layer_bonds(sandwiches, instances, step)
     editor.propagate_layer_sheets(sandwiches, instances, step)
     source_atoms = {_atom_key(row): row for row in editor.atoms}
@@ -2593,11 +3358,40 @@ def structure_from_chimerax(session, model):
     mmcif_write._set_standard_residues()
     position = model.scene_position
     transform = None if position.is_identity() else position
-    with StringIO() as stream:
-        mmcif_write.save_structure(session, stream, [model], [transform], set(),
-                                  False, False, True, False, False, False)
-        return StructureEditor.from_string(stream.getvalue(),
-                                           source_name=f'ChimeraX model #{model.id_string}')
+    alternates = [(a, a.alt_loc) for a in model.atoms if a.num_alt_locs]
+    notify = model.alt_loc_change_notify
+    try:
+        model.alt_loc_change_notify = False
+        with StringIO() as stream:
+            mmcif_write.save_structure(session, stream, [model], [transform], set(),
+                                      False, False, True, False, False, False)
+            return StructureEditor.from_string(stream.getvalue(),
+                                               source_name=f'ChimeraX model #{model.id_string}')
+    finally:
+        try:
+            for atom, loc in alternates:
+                if atom.alt_loc != loc:
+                    atom.alt_loc = loc
+        finally:
+            model.alt_loc_change_notify = notify
+
+
+def capture_active_alt_locs(model):
+    return {(a.residue.chain_id, str(a.residue.number), a.residue.insertion_code.strip(),
+             a.residue.name, a.name): a.alt_loc for a in model.atoms if a.num_alt_locs}
+
+
+def restore_active_alt_locs(model, states, report=None):
+    origins = {new: old for group in (report or {}).get('chain_copies', [])
+               for old, new in group['author_chains'].items()}
+    for atom in model.atoms:
+        if not atom.num_alt_locs:
+            continue
+        r = atom.residue
+        key = (origins.get(r.chain_id, r.chain_id), str(r.number), r.insertion_code.strip(), r.name, atom.name)
+        loc = (states or {}).get(key)
+        if loc is not None and atom.has_alt_loc(loc):
+            atom.alt_loc = loc
 
 
 def structure_model_format(model):
@@ -2651,6 +3445,7 @@ def create_structure_working_copy(session, model, path, format):
         report = editor.write(path, format='cif' if format == 'mmcif' else 'pdb')
     if isinstance(path, StructureBuffer):
         path.component_styles = capture_component_styles(model)
+        path.active_alt_locs = capture_active_alt_locs(model)
     for issue in report.get('source_issues', []):
         session.logger.warning(issue['warning'])
     return report
@@ -2680,6 +3475,85 @@ def update_secondary_structure_from_chimerax(session, model_id, path):
     editor.write(path,format='cif' if editor.is_cif else 'pdb')
 
 
+try:
+    from chimerax.core.state import StateManager
+except ModuleNotFoundError as exc:
+    if not exc.name.startswith('chimerax'):
+        raise
+    StateManager = object
+
+
+class AmyloidSessionState(StateManager):
+    """Persist editing metadata alongside the native model in ChimeraX sessions."""
+
+    def take_snapshot(self, session, flags):
+        structures = []
+        for model in session.models.list():
+            source = getattr(model, '_amyloid_structure', None)
+            if source is not None:
+                structures.append((model, {
+                    'name': source.name, 'text': source.text, 'format': source.format,
+                    # JSON also handles NumPy SeedSequence's 128-bit entropy.
+                    'report_json': json.dumps(source.report, ensure_ascii=False)}))
+        return {'version': 1, 'structures': structures}
+
+    @classmethod
+    def restore_snapshot(cls, session, data):
+        state = cls()
+        session.amyloid_modifier_state = state
+        for model, saved in data.get('structures', []):
+            if model is None or model.deleted:
+                continue
+            source = StructureBuffer(saved['name'], saved['text'], json.loads(saved['report_json']))
+            source.format = saved['format']
+            model._amyloid_structure = source
+            _attach_preserved_annotations(model, source)
+        return state
+
+    def reset_state(self, session):
+        # The state is owned by each model and disappears when that model closes.
+        pass
+
+
+def _ensure_session_state(session):
+    if not hasattr(session, 'amyloid_modifier_state'):
+        session.amyloid_modifier_state = AmyloidSessionState()
+
+
+def _install_annotation_save_adapter():
+    """One idempotent adapter; untagged models go directly to the native saver.
+
+    ChimeraX 1.9 offers no per-model extension hook for arbitrary CIF categories.
+    Keep this compatibility boundary small and preserve the wrapped callable.
+    """
+    from chimerax.mmcif import mmcif_write
+    native = mmcif_write.save_structure
+    if getattr(native, '_amyloid_preserves_annotations', False):
+        return
+
+    @wraps(native)
+    def save_with_annotations(session, file, models, *args, **kwargs):
+        result = native(session, file, models, *args, **kwargs)
+        preserved = {}
+        for saved_model in models:
+            for category, rows in getattr(saved_model, '_amyloid_unrecognized_categories', {}).items():
+                if category not in preserved:
+                    preserved[category] = deepcopy(rows)
+                elif preserved[category] != rows:
+                    preserved[category].extend(deepcopy(rows))
+        if preserved:
+            gemmi, _ = _structure_dependencies()
+            block = gemmi.cif.Block('annotations')
+            for category, rows in preserved.items():
+                _set_cif_rows(block, category, rows)
+            file.write('\n# Original annotations retained without remapping.\n' +
+                       block.as_string().split('\n', 1)[1])
+        return result
+
+    save_with_annotations._amyloid_preserves_annotations = True
+    mmcif_write.save_structure = save_with_annotations
+
+
 def _attach_preserved_annotations(model, source):
     editor = StructureEditor(source)
     categories = editor.unrecognized_cif_categories()
@@ -2698,34 +3572,8 @@ def _attach_preserved_annotations(model, source):
         categories['_amyloid_unrecognized_pdb.'] = [
             {'id': str(i), 'text': line} for i, line in enumerate(records, 1)]
     model._amyloid_unrecognized_categories = categories
-    if not categories:
-        return
-    from chimerax.mmcif import mmcif_write
-    native = mmcif_write.save_structure
-    if getattr(native, '_amyloid_preserves_annotations', False):
-        return
-
-    def save_with_annotations(session, file, models, *args, **kwargs):
-        result = native(session, file, models, *args, **kwargs)
-        preserved = {}
-        for saved_model in models:
-            for category, rows in getattr(saved_model, '_amyloid_unrecognized_categories', {}).items():
-                if category not in preserved:
-                    preserved[category] = deepcopy(rows)
-                elif preserved[category] != rows:
-                    preserved[category].extend(deepcopy(rows))
-        if preserved:
-            gemmi, _ = _structure_dependencies()
-            block = gemmi.cif.Block('annotations')
-            for category, rows in preserved.items():
-                _set_cif_rows(block, category, rows)
-            # Append categories to the current data block, before the next model.
-            file.write('\n# Original annotations retained without remapping.\n' +
-                       block.as_string().split('\n', 1)[1])
-        return result
-
-    save_with_annotations._amyloid_preserves_annotations = True
-    mmcif_write.save_structure = save_with_annotations
+    if categories:
+        _install_annotation_save_adapter()
 
 
 def open_structure_buffer(session, source):
@@ -2733,8 +3581,10 @@ def open_structure_buffer(session, source):
     if source.format == 'pdb':
         editor = StructureEditor(source)
         if any(len(chain) > 1 for chain in editor.chains):
-            # Native PDB parsing can reinterpret column 21 as a fourth residue character during later structure processing (TFX/AA -> TFXA/A).
-            # Gemmi already validated extended chain IDs; load those identities through explicit mmCIF fields while retaining the PDB working copy.
+            # Native PDB parsing can reinterpret column 21 as a fourth residue
+            # character during later structure processing (TFX/AA -> TFXA/A).
+            # Gemmi already validated extended chain IDs; load those identities
+            # through explicit mmCIF fields while retaining the PDB working copy.
             editor.rename({})
             parse_source = StructureBuffer(os.path.splitext(source.name)[0] + '.cif')
             editor.write(parse_source, format='cif')
@@ -2773,8 +3623,11 @@ def open_structure_buffer(session, source):
         for model in models:
             # Attach in-memory provenance so later tool instances can reuse source metadata.
             model._amyloid_structure = StructureBuffer(source.name, source.text, source.report)
+            model._amyloid_structure.copy_from(source)
+            restore_active_alt_locs(model, source.active_alt_locs, source.report)
             _attach_preserved_annotations(model, source)
         session.models.add(models)
+        _ensure_session_state(session)
         if source.component_styles:
             for model in models:
                 restore_component_styles(model, source.component_styles, source.report)
@@ -2785,8 +3638,85 @@ def open_structure_buffer(session, source):
     return models
 
 
+def protofilament_selection_targets(editor, detection, axial_limit=4.0):
+    """Residue-exact targets; author chains can contain both protein and ligand."""
+    _, np = _structure_dependencies()
+    stacks = detection['sandwiches']
+    first = [r for r in editor.atoms if str(r['pdbx_PDB_model_num']) == editor.models[0]]
+    targets = []
+    for i, stack in enumerate(stacks):
+        targets.append(dict(kind='protein', pf=i,
+            label=f'Protein protofilament with Chain {stack[len(stack)//2]}',
+            residues=frozenset(_residue_key(r) for r in first
+                if r['auth_asym_id'] in stack and r['label_asym_id'] in editor.protein_labels)))
+
+    # Reuse the editor's site/occupancy detection, retaining complete RNA/DNA
+    # molecules too. Waters and monatomic ions are not ligand protofilaments.
+    molecules = [rows for rows in editor.companion_groups()
+                 if len({r['label_atom_id'] for r in rows}) > 1
+                 and rows[0]['label_comp_id'] not in ('HOH', 'WAT', 'DOD')]
+    eligible = {_residue_key(r) for rows in molecules for r in rows}
+    rises = [p['unit_rise'] for p in detection['protofilaments'] if p['unit_rise']]
+    sites = (editor.associated_residue_repeats(stacks, detection['axis'],
+                float(np.median(rises)), axial_limit)
+             if rises and detection['axis'] is not None else [])
+    assigned = set()
+    for site in sites:
+        keys = frozenset(k for member in site['residues'] for k in member['keys']) & eligible
+        if keys:
+            targets.append(dict(kind='ligand', residues=keys, copies=len(site['residues'])))
+            assigned.update(keys)
+    # Do not silently omit molecules outside the axial association window or
+    # in a one-layer fragment where the stacking axis cannot be determined.
+    for rows in molecules:
+        keys = frozenset(_residue_key(r) for r in rows)
+        if not keys & assigned:
+            targets.append(dict(kind='ligand', residues=keys, copies=1))
+    for number, target in enumerate((t for t in targets if t['kind'] == 'ligand'), 1):
+        keys = sorted(target['residues'])
+        names = '/'.join(sorted({k[-1] for k in keys}))
+        anchor = keys[0]
+        target['label'] = (f'Ligand {names} site {number} ({target["copies"]} copies; '
+                           f'{anchor[0]}:{anchor[1]}{anchor[2]})')
+    return targets
+
+
+def select_protofilament_target(session, model_id, target, mode='new'):
+    """Use native selection operations, including bonds and undo, on exact residues."""
+    from chimerax.atomic import AtomicStructure, Residues
+    from chimerax.core.objects import Objects
+    from chimerax.std_commands.select import select, select_add, select_subtract, select_intersect
+    operations = dict(new=select, add=select_add, subtract=select_subtract, intersect=select_intersect)
+    if mode not in operations:
+        raise StructureEditError('Unknown selection mode: ' + str(mode))
+    model = next((m for m in session.models.list(type=AtomicStructure) if m.id_string == model_id), None)
+    if model is None:
+        raise StructureEditError('The working model is no longer open. Load it again.')
+    keys = target['residues']
+    residues = [r for r in model.residues
+                if (r.chain_id, str(r.number), _null_id(r.insertion_code), r.name) in keys]
+    found = {(r.chain_id, str(r.number), _null_id(r.insertion_code), r.name) for r in residues}
+    if found != keys:
+        raise StructureEditError('The model residue identities changed. Reload the model before selecting.')
+    atoms = Residues(residues).atoms
+    objects = Objects(atoms=atoms, bonds=atoms.intra_bonds, pseudobonds=atoms.intra_pseudobonds)
+    operations[mode](session, objects)
+    return len(atoms)
+
+
+def trim_ligand_target(editor, target):
+    keys = target['residues']
+    if keys & editor.covalent_residue_owners().keys():
+        raise StructureEditError('This ligand site is covalently attached to protein; it cannot be trimmed independently.')
+    rows = [r for r in editor.atoms if _residue_key(r) not in keys]
+    editor.report['operation'] = 'trim ligand site'
+    return editor.apply_copies([dict(chains={r['auth_asym_id']: r['auth_asym_id'] for r in rows},
+                                    atom_ids={r['id'] for r in rows})])
+
+
 def _display_components(model):
-    # Native collection operations: one state per chain/polymer or ligand type, with no Python atom-by-atom identity or rendering-state map.
+    # Native collection operations: one state per chain/polymer or ligand type,
+    # with no Python atom-by-atom identity or rendering-state map.
     import numpy as np
     for _, chain, atoms in model.atoms.by_chain:
         types = atoms.residues.polymer_types
@@ -2819,7 +3749,8 @@ def capture_component_styles(model):
 
 
 def restore_component_styles(model, styles, report=None):
-    # Each new chain inherits from the actual expansion/rename donor, so distinct protofilament styles remain distinct even when chain IDs change on trimming.
+    # Each new chain inherits from the actual expansion/rename donor, so distinct
+    # protofilament styles remain distinct even when chain IDs change on trimming.
     origins = {new: old for group in (report or {}).get('chain_copies', [])
                for old, new in group['author_chains'].items()}
     for (chain, polymer_type, component), atoms in _display_components(model):
@@ -2842,12 +3773,14 @@ def replace_structure_buffer(session, source, model_id=None):
     from chimerax.core.models import MODEL_ID_CHANGED
     previous = next((m for m in session.models.list() if m.id_string == model_id), None)
     styles = capture_component_styles(previous) if previous is not None else None
+    alt_locs = capture_active_alt_locs(previous) if previous is not None else None
     models = open_structure_buffer(session, source)
     if previous is None:
         return models
     replacement = models[0]
     try:
         restore_component_styles(replacement, styles, source.report)
+        restore_active_alt_locs(replacement, alt_locs, source.report)
         replacement.display = previous.display
     except Exception:
         session.models.close(models)
@@ -2868,22 +3801,21 @@ def replace_structure_buffer(session, source, model_id=None):
 
 
 try:
-    from PyQt6.QtWidgets import (QApplication, QWidget, QLabel, QLineEdit, 
-                                 QPushButton, QTextEdit, QMessageBox, QFileDialog, 
+    from PyQt6.QtWidgets import (QApplication, QWidget, QLabel, QLineEdit,
+                                 QPushButton, QTextEdit, QMessageBox, QFileDialog,
                                  QVBoxLayout, QHBoxLayout, QSizePolicy, QSlider,
-                                 QSplitter, QSpinBox, QGroupBox, QFormLayout, 
-                                 QCheckBox, QTableWidget, QHeaderView, QTableWidgetItem, 
-                                 QTextBrowser, QDialog, QComboBox, QTabWidget)
+                                 QSplitter, QSpinBox, QGroupBox, QFormLayout,
+                                 QCheckBox, QTableWidget, QHeaderView, QTableWidgetItem,
+                                 QTextBrowser, QDialog, QComboBox, QTabWidget, QButtonGroup, QFrame)
     from PyQt6.QtCore import Qt, QTimer
     from chimerax.core.tools import ToolInstance
     from chimerax.core.commands import run
-    
+
 except ModuleNotFoundError as exc:
     if not (exc.name.startswith('PyQt6') or exc.name.startswith('chimerax')):
         raise
     ToolInstance = object
 
-toplevel_windows = []
 
 def show_error_message(message):
     msg = QMessageBox()
@@ -2897,7 +3829,8 @@ def open_chain_modifier():
         import numpy as np
         import matplotlib
         matplotlib.use('qtagg')
-        from PyQt6.QtGui import QDoubleValidator, QIntValidator
+        from PyQt6.QtGui import QDoubleValidator, QIntValidator, QIcon, QColor, QPainter, QPainterPath, QPen, QPixmap
+        from PyQt6.QtCore import QRectF, QSize
         from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
         from matplotlib.figure import Figure
     except ImportError as e:
@@ -2907,13 +3840,36 @@ def open_chain_modifier():
     def generate_chain_id(index):
         return structure_chain_id(index)
 
+    def selection_mode_icon(mode):
+        # Photoshop-style square set operations, painted at double resolution
+        # so the small toolbar glyphs stay crisp on high-DPI displays.
+        first, second = QPainterPath(), QPainterPath()
+        first.addRect(QRectF(4, 4, 10, 10) if mode != 'new' else QRectF(5, 5, 14, 14))
+        second.addRect(QRectF(10, 10, 10, 10))
+        filled = {'new': first, 'add': first.united(second),
+                  'subtract': first.subtracted(second), 'intersect': first.intersected(second)}[mode]
+        icon = QIcon()
+        for state, color in ((QIcon.State.Off, '#d4d4d4'), (QIcon.State.On, '#98c379')):
+            pixmap = QPixmap(48, 48)
+            pixmap.setDevicePixelRatio(2)
+            pixmap.fill(Qt.GlobalColor.transparent)
+            painter = QPainter(pixmap)
+            painter.fillPath(filled, QColor(color))
+            painter.setPen(QPen(QColor(color), 1))
+            painter.drawPath(first)
+            if mode != 'new':
+                painter.drawPath(second)
+            painter.end()
+            icon.addPixmap(pixmap, QIcon.Mode.Normal, state)
+        return icon
+
     class TrimDialog(QDialog):
         def __init__(self, layers, full_cif_data, original_filename, parent=None):
             super().__init__(parent)
             self.setWindowTitle("Trim Layers")
             self.resize(800, 600)
-            self.layers = layers  
-            self.full_cif_data = full_cif_data 
+            self.layers = layers
+            self.full_cif_data = full_cif_data
             self.original_filename = original_filename
             self.initUI()
             qt_app = QApplication.instance()
@@ -2946,8 +3902,8 @@ def open_chain_modifier():
 
         def populate_table(self):
             self.table.setRowCount(len(self.layers))
-            self.table.setFocusPolicy(Qt.FocusPolicy.NoFocus) 
-            self.table.setSelectionMode(QTableWidget.SelectionMode.NoSelection) 
+            self.table.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+            self.table.setSelectionMode(QTableWidget.SelectionMode.NoSelection)
 
             for i, layer in enumerate(self.layers):
                 widget = QWidget(); chk = QCheckBox()
@@ -2957,7 +3913,7 @@ def open_chain_modifier():
 
                 rank_item = QTableWidgetItem(layer.get('layer_label', str(i + 1)))
                 rank_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
-                rank_item.setFlags(Qt.ItemFlag.ItemIsEnabled) 
+                rank_item.setFlags(Qt.ItemFlag.ItemIsEnabled)
                 self.table.setItem(i, 1, rank_item)
 
                 chains_item = QTableWidgetItem(", ".join(layer['chains']))
@@ -2974,28 +3930,34 @@ def open_chain_modifier():
                 widget = self.table.cellWidget(i, 0)
                 checkbox = widget.findChild(QCheckBox)
                 if checkbox and checkbox.isChecked():
-                    for cid in self.layers[i]['chains']: 
+                    for cid in self.layers[i]['chains']:
                         selected.append(cid)
-            
+
             if not selected:
                 QMessageBox.warning(self, "Warning", "No layers selected.")
                 return
-            
+
             mapping = {old: generate_chain_id(idx) for idx, old in enumerate(selected)}
-            name_part, ext = os.path.splitext(os.path.basename(self.original_filename))
-            
+            name_part, _ = os.path.splitext(os.path.basename(self.original_filename))
+
             path = StructureBuffer(f"{name_part}_trimmed.cif")
-            
+
             try:
-                self.write_cif(path, mapping)
-                
                 parent_widget = self.parent()
                 if parent_widget:
+                    if parent_widget.working_structure is not self.full_cif_data['source']:
+                        raise StructureEditError('The working structure changed. Reopen the trim window.')
+                    if not parent_widget.sync_viewer_to_structure():
+                        return
+                if set(mapping) - set(StructureEditor(self.full_cif_data['source']).chains):
+                    raise StructureEditError('Selected chains changed or were deleted. Reopen the trim window.')
+                self.write_cif(path, mapping)
+                if parent_widget:
                     open_structure_buffer(parent_widget.session, path)
-                    
+
                 QMessageBox.information(self, "Success", f"Trimmed model loaded into ChimeraX!\n(Renamed {len(mapping)} chains)")
                 self.accept()
-            except Exception as e: 
+            except Exception as e:
                 QMessageBox.critical(self, "Error", str(e))
 
         def write_cif(self, path, mapping):
@@ -3010,7 +3972,7 @@ def open_chain_modifier():
             self.fig.set_facecolor('#2C2C2C')
             self.axes = self.fig.add_subplot(111, projection='3d')
             self.axes.set_facecolor('#2C2C2C')
-            self.axes.axis('off') 
+            self.axes.axis('off')
             self.fig.subplots_adjust(left=0, right=1, bottom=0, top=1)
             super().__init__(self.fig)
             self.setParent(parent)
@@ -3019,9 +3981,9 @@ def open_chain_modifier():
             self.updateGeometry()
             self.global_center = (0, 0, 0)
             self.max_range = 10.0
-            self.zoom_level = 50 
+            self.zoom_level = 50
             self.mpl_connect('scroll_event', self.on_scroll)
-            self.slider_callback = None 
+            self.slider_callback = None
 
         def on_scroll(self, event):
             if event.inaxes != self.axes: return
@@ -3053,15 +4015,15 @@ def open_chain_modifier():
             if not chains_data:
                 self.draw()
                 return
-                
+
             if label_ids is None: label_ids = set()
             chain_ids = sorted(list(chains_data.keys()))
-            
+
             all_points = []
             calc_targets = label_ids if label_ids else chain_ids
             for cid in calc_targets:
                 if cid in chains_data: all_points.extend(chains_data[cid])
-            
+
             if not all_points: return
 
             xs_all = [p[0] for p in all_points]
@@ -3077,7 +4039,7 @@ def open_chain_modifier():
                 coords = chains_data[cid]
                 if not coords: continue
                 xs, ys, zs = zip(*coords)
-                color = "#FFFFFF" 
+                color = "#FFFFFF"
                 self.axes.plot(xs, ys, zs, c=color, linewidth=1.5, alpha=0.6)
                 if cid in label_ids and len(coords) > 0:
                     lx, ly, lz = coords[0]
@@ -3124,9 +4086,9 @@ def open_chain_modifier():
             if self.max_range == 0: return
             factor = 2.0 - ((self.zoom_level / 100.0) * 1.9)
             if factor < 0.05: factor = 0.05
-            
+
             gx, gy, gz = self.global_center
-            
+
             if hasattr(self, 'data_ranges'):
                 dx, dy, dz = self.data_ranges
                 self.axes.set_xlim(gx - (dx/2)*factor, gx + (dx/2)*factor)
@@ -3141,34 +4103,34 @@ def open_chain_modifier():
             elev, azim = self.axes.elev, self.axes.azim
             self.axes.clear()
             self.axes.axis('off')
-            
-            if not chains_data: 
+
+            if not chains_data:
                 self.draw()
                 return
-                
+
             if label_ids is None: label_ids = set()
             cids = sorted(chains_data.keys())
-            
+
             if not preserve_view or self.max_range == 10.0:
                 all_p = [p for cid in cids if cid in chains_data for p in chains_data[cid]]
                 if all_p:
                     xs, ys, zs = zip(*all_p)
                     gx, gy, gz = sum(xs)/len(xs), sum(ys)/len(ys), sum(zs)/len(zs)
                     self.global_center = (gx, gy, gz)
-                    
+
                     dx = max(xs) - min(xs)
                     dy = max(ys) - min(ys)
                     dz = max(zs) - min(zs)
-                    
+
                     self.data_ranges = (max(dx, 1)*1.1, max(dy, 1)*1.1, max(dz, 1)*1.1)
-                    
+
                     try:
                         self.axes.set_box_aspect(self.data_ranges)
                     except AttributeError:
                         pass
-                    
+
                     self.max_range = max([math.sqrt((p[0]-gx)**2+(p[1]-gy)**2+(p[2]-gz)**2) for p in all_p]) or 10.0
-            
+
             for cid in cids:
                 coords = chains_data[cid]
                 if not coords: continue
@@ -3177,92 +4139,25 @@ def open_chain_modifier():
                 self.axes.plot(xs, ys, zs, c=col, linewidth=w, alpha=a)
                 if cid in label_ids:
                     self.axes.text(coords[0][0], coords[0][1], coords[0][2], f"{cid}", color='black', fontsize=11, weight='bold', bbox=dict(facecolor='white', alpha=0.9, edgecolor='#333', boxstyle='round,pad=0.3'))
-            
+
             if waters:
                 wx, wy, wz = zip(*waters)
                 self.axes.scatter(wx, wy, wz, c='lightblue', s=10, alpha=0.8, edgecolors='none')
             if ions:
                 ix, iy, iz = zip(*ions)
                 self.axes.scatter(ix, iy, iz, c='lightpink', s=15, alpha=0.9, edgecolors='none')
-                
+
             if preserve_view: self.axes.view_init(elev=elev, azim=azim)
             self.apply_zoom()
 
-    class CIFLayerIdentifier(QWidget):
-        def __init__(self, tool_instance, session):
-            super().__init__()
-            self.tool_instance = tool_instance
-            self.session = session
-            self._last_model_ids = set()
-            
-            
-            self.working_structure = None; self.layers_result = []; self.full_cif_data = {}
-            self.initUI()
-            qt_app = QApplication.instance()
-            if qt_app: 
-                self.setStyleSheet(qt_app.styleSheet())
+    class WorkingModelMixin:
+        """Own the live model ID and its last successfully committed buffer."""
 
-        def initUI(self):
-            main_l = QHBoxLayout()
-            splitter = QSplitter(Qt.Orientation.Horizontal)
-            left = QWidget(); l_lay = QVBoxLayout(left); l_lay.setSpacing(2); l_lay.setContentsMargins(4, 4, 4, 4)
-            
-            hb_load = QHBoxLayout()
-            self.cmb_models = QComboBox()
-            self.cmb_models.wheelEvent = lambda event: event.ignore()
-            self.cmb_models.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
-            self.populate_models()
-            hb_load.addWidget(self.cmb_models)
-            
-            self.auto_refresh_timer = QTimer(self)
-            self.auto_refresh_timer.timeout.connect(self.populate_models)
-            self.auto_refresh_timer.timeout.connect(self.check_live_edits)
-            self.auto_refresh_timer.start(1000)
-            
-            self.btn_load_model = QPushButton('Load Model')
-            self.btn_load_model.clicked.connect(self.load_from_chimerax)
-            hb_load.addWidget(self.btn_load_model)
-            l_lay.addLayout(hb_load)
-            
-            self.lbl_status = QLabel("No file loaded"); self.lbl_status.setStyleSheet("color: gray; font-style: italic;")
-            l_lay.addWidget(self.lbl_status)
-            
-            self.grp_ops = QGroupBox("Operations"); self.grp_ops.setEnabled(False)
-            ops_l = QVBoxLayout(); ops_l.setSpacing(2); ops_l.setContentsMargins(4, 10, 4, 4)
-            self.btn_trim = QPushButton("Trim Chain Units")
-            self.btn_trim.setToolTip("Keep selected layers in a new model; use ChimeraX Save to save it")
-            self.btn_trim.clicked.connect(self.open_trim_dialog)
-            ops_l.addWidget(self.btn_trim)
-            self.grp_ops.setLayout(ops_l); l_lay.addWidget(self.grp_ops)
-            
-            grp_p = QGroupBox("Detection Parameters"); form = QFormLayout(); form.setContentsMargins(4, 10, 4, 4); form.setVerticalSpacing(2)
-            self.ed_chn = QLineEdit("4"); self.ed_chn.setValidator(QIntValidator())
-            form.addRow("Chains per Layer:", self.ed_chn)
-            self.ed_zmn = QLineEdit("0.0"); self.ed_zmn.setValidator(QDoubleValidator())
-            form.addRow("Z Shift Min (Å):", self.ed_zmn)
-            self.ed_zmx = QLineEdit("4.0"); self.ed_zmx.setValidator(QDoubleValidator())
-            form.addRow("Z Shift Max (Å):", self.ed_zmx)
-            self.ed_chn.editingFinished.connect(self.recalc); self.ed_zmn.editingFinished.connect(self.recalc); self.ed_zmx.editingFinished.connect(self.recalc)
-            for field in (self.ed_chn, self.ed_zmn, self.ed_zmx):
-                field.hide()
-                form.labelForField(field).hide()
-            grp_p.setLayout(form); l_lay.addWidget(grp_p)
-            
-            self.txt = QTextBrowser(); self.txt.setOpenLinks(False); self.txt.anchorClicked.connect(self.link_clk)
-            self.txt.setStyleSheet("font-family: Consolas, monospace;")
-            self.txt.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
-            l_lay.addWidget(self.txt, 1)
-            
-            right = QWidget(); r_lay = QHBoxLayout(right); r_lay.setContentsMargins(0,0,0,0)
-            self.cvs = CIFMol3DCanvas(self, dpi=100); r_lay.addWidget(self.cvs, 1)
-            sl = QSlider(Qt.Orientation.Vertical); sl.setRange(1, 100); sl.setValue(50); sl.valueChanged.connect(lambda v: self.cvs.set_zoom_from_slider(v))
-            self.cvs.slider_callback = lambda v: sl.setValue(v)
-            r_lay.addWidget(sl)
-            
-            splitter.addWidget(left); splitter.addWidget(right)
-             
-            splitter.setStretchFactor(0, 5); splitter.setStretchFactor(1, 5)
-            main_l.addWidget(splitter); self.setLayout(main_l)
+        def operation_log(self, message):
+            log = getattr(self, 'text_area', None) or getattr(self, 'txt', None)
+            if log is not None:
+                # Explicit markup makes Qt decode escaped text instead of showing entities.
+                log.append('<div>' + escape(str(message)).replace('\n', '<br>') + '</div>')
 
         def sync_viewer_to_structure(self):
             if self.working_model_id and self.working_structure:
@@ -3272,6 +4167,134 @@ def open_chain_modifier():
                     self.session.logger.error('Coordinate synchronization stopped: ' + str(exc))
                     return False
             return True
+
+
+        def populate_models(self):
+            from chimerax.atomic import AtomicStructure
+            current_models = self.session.models.list(type=AtomicStructure)
+            current_ids = {(m.id_string, id(m)) for m in current_models}
+
+            if current_ids != self._last_model_ids:
+                current_sel = self.cmb_models.currentData()
+                try:
+                    current_sel_id = current_sel.id_string if current_sel and not getattr(current_sel, 'deleted', False) else None
+                except Exception:
+                    current_sel_id = None
+
+                if not current_sel_id and getattr(self, 'working_model_id', None):
+                    current_sel_id = self.working_model_id
+
+                self.cmb_models.blockSignals(True)
+                self.cmb_models.clear()
+
+                for model in current_models:
+                    item_text = f"#{model.id_string} {model.name}"
+                    self.cmb_models.addItem(item_text, userData=model)
+                    self.cmb_models.setItemData(self.cmb_models.count() - 1, item_text, Qt.ItemDataRole.ToolTipRole)
+
+                if current_sel_id:
+                    for i in range(self.cmb_models.count()):
+                        m = self.cmb_models.itemData(i)
+                        if m and getattr(m, 'id_string', '') == current_sel_id:
+                            self.cmb_models.setCurrentIndex(i)
+                            break
+
+                self.cmb_models.blockSignals(False)
+                self._last_model_ids = current_ids
+
+
+        def commit_working_structure(self, candidate, *, new_model=False):
+            """Open and validate first; commit GUI state after replacement succeeds."""
+            if not candidate:
+                return False
+            target_id = None if new_model else self.working_model_id
+            self._reload_in_progress = True
+            camera = self.session.main_view.camera.position
+            try:
+                models = replace_structure_buffer(self.session, candidate, target_id)
+                first_model = models[0]
+                if self.working_structure is None or new_model:
+                    self.working_structure = candidate
+                elif candidate is not self.working_structure:
+                    self.working_structure.copy_from(candidate)
+                self.working_model_id = first_model.id_string
+                self._last_live_atom_count = len(first_model.atoms)
+                return True
+            except Exception as exc:
+                self.operation_log('Model reload failed; previous model and edit buffer kept: ' + str(exc))
+                return False
+            finally:
+                self.session.main_view.camera.position = camera
+                self._reload_in_progress = False
+
+        def reload_working_model(self):
+            return self.commit_working_structure(self.working_structure)
+
+    class CIFLayerIdentifier(WorkingModelMixin, QWidget):
+        def __init__(self, tool_instance, session):
+            super().__init__()
+            self.tool_instance = tool_instance
+            self.session = session
+            self._last_model_ids = set()
+
+
+            self.working_structure = None
+            self.working_model_id = None
+            self.layers_result = []
+            self.full_cif_data = {}
+            self.initUI()
+            qt_app = QApplication.instance()
+            if qt_app:
+                self.setStyleSheet(qt_app.styleSheet())
+
+        def initUI(self):
+            main_l = QHBoxLayout()
+            splitter = QSplitter(Qt.Orientation.Horizontal)
+            left = QWidget(); l_lay = QVBoxLayout(left); l_lay.setSpacing(2); l_lay.setContentsMargins(4, 4, 4, 4)
+
+            hb_load = QHBoxLayout()
+            self.cmb_models = QComboBox()
+            self.cmb_models.wheelEvent = lambda event: event.ignore()
+            self.cmb_models.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+            self.populate_models()
+            hb_load.addWidget(self.cmb_models)
+
+            self.auto_refresh_timer = QTimer(self)
+            self.auto_refresh_timer.timeout.connect(self.populate_models)
+            self.auto_refresh_timer.timeout.connect(self.check_live_edits)
+            self.auto_refresh_timer.start(1000)
+
+            self.btn_load_model = QPushButton('Load Model')
+            self.btn_load_model.clicked.connect(self.load_from_chimerax)
+            hb_load.addWidget(self.btn_load_model)
+            l_lay.addLayout(hb_load)
+
+            self.lbl_status = QLabel("No file loaded"); self.lbl_status.setStyleSheet("color: gray; font-style: italic;")
+            l_lay.addWidget(self.lbl_status)
+
+            self.grp_ops = QGroupBox("Operations"); self.grp_ops.setEnabled(False)
+            ops_l = QVBoxLayout(); ops_l.setSpacing(2); ops_l.setContentsMargins(4, 10, 4, 4)
+            self.btn_trim = QPushButton("Trim Chain Units")
+            self.btn_trim.setToolTip("Keep selected layers in a new model; use ChimeraX Save to save it")
+            self.btn_trim.clicked.connect(self.open_trim_dialog)
+            ops_l.addWidget(self.btn_trim)
+            self.grp_ops.setLayout(ops_l); l_lay.addWidget(self.grp_ops)
+
+            self.txt = QTextBrowser(); self.txt.setOpenLinks(False); self.txt.anchorClicked.connect(self.link_clk)
+            self.txt.setStyleSheet("font-family: Consolas, monospace;")
+            self.txt.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+            l_lay.addWidget(self.txt, 1)
+
+            right = QWidget(); r_lay = QHBoxLayout(right); r_lay.setContentsMargins(0,0,0,0)
+            self.cvs = CIFMol3DCanvas(self, dpi=100); r_lay.addWidget(self.cvs, 1)
+            sl = QSlider(Qt.Orientation.Vertical); sl.setRange(1, 100); sl.setValue(50); sl.valueChanged.connect(lambda v: self.cvs.set_zoom_from_slider(v))
+            self.cvs.slider_callback = lambda v: sl.setValue(v)
+            r_lay.addWidget(sl)
+
+            splitter.addWidget(left); splitter.addWidget(right)
+
+            splitter.setStretchFactor(0, 5); splitter.setStretchFactor(1, 5)
+            main_l.addWidget(splitter); self.setLayout(main_l)
 
 
         def check_live_edits(self):
@@ -3290,7 +4313,7 @@ def open_chain_modifier():
                                 return
                             self.process_cif(self.working_structure)
                         break
-                
+
                 if not found:
                     self.working_model_id = None
                     self.working_structure = None
@@ -3299,83 +4322,33 @@ def open_chain_modifier():
                     self.cvs.axes.axis('off')
                     self.cvs.draw()
                     self.txt.append("<br><b>>>> Working model was closed in ChimeraX. Tool cleared.</b><br>")
-            except Exception:
-                pass
+            except Exception as exc:
+                message = 'Live model refresh failed: ' + str(exc)
+                if message != getattr(self, '_last_refresh_error', None):
+                    self.session.logger.warning(message)
+                    self._last_refresh_error = message
 
-        def populate_models(self):
-            from chimerax.atomic import AtomicStructure
-            current_models = self.session.models.list(type=AtomicStructure)
-            current_ids = {(m.id_string, id(m)) for m in current_models}
-            if current_ids != self._last_model_ids:
-                current_sel = self.cmb_models.currentData()
-                try:
-                    current_sel_id = current_sel.id_string if current_sel and not getattr(current_sel, 'deleted', False) else None
-                except Exception:
-                    current_sel_id = None
-                    
-                if not current_sel_id and getattr(self, 'working_model_id', None):
-                    current_sel_id = self.working_model_id
-                    
-                self.cmb_models.blockSignals(True)
-                self.cmb_models.clear()
-                for model in current_models:
-                    item_text = f"#{model.id_string} {model.name}"
-                    self.cmb_models.addItem(item_text, userData=model)
-                    self.cmb_models.setItemData(self.cmb_models.count() - 1, item_text, Qt.ItemDataRole.ToolTipRole)
-                if current_sel_id:
-                    for i in range(self.cmb_models.count()):
-                        m = self.cmb_models.itemData(i)
-                        if m and getattr(m, 'id_string', '') == current_sel_id:
-                            self.cmb_models.setCurrentIndex(i)
-                            break
-                self.cmb_models.blockSignals(False)
-                self._last_model_ids = current_ids
-
-        def reload_working_model(self):
-            target_id = getattr(self, 'working_model_id', None)
-            
-            try:
-                from chimerax.core.commands import run
-                
-                try: run(self.session, "view name chimerax_modifier_locked_view")
-                except: pass
-                
-                models = replace_structure_buffer(self.session, self.working_structure, target_id)
-                    
-                if models:
-                    first_item = models[0]
-                    first_model = first_item[0] if isinstance(first_item, (list, tuple)) else first_item
-                    if hasattr(first_model, 'id_string'):
-                        self.working_model_id = first_model.id_string
-                        self._last_live_atom_count = len(first_model.atoms) if hasattr(first_model, 'atoms') else 0
-                try: run(self.session, "view chimerax_modifier_locked_view")
-                except: pass
-                
-            except Exception as e:
-                self.txt.append(f"\nModel display warning: {e}")
 
         def load_from_chimerax(self):
             model = self.cmb_models.currentData()
             if not model: return
-            self._axis_reference = None
             self._load_in_progress = True
             try:
                 self.loaded_filename = model.name
-                
+
                 name_part, _ = os.path.splitext(self.loaded_filename)
                 working = StructureBuffer(f"{name_part}_modified.cif")
-                
+
                 create_structure_working_copy(self.session, model, working, "mmcif")
-                self.working_structure = working
+                if not self.commit_working_structure(working, new_model=True):
+                    return
+                self._axis_reference = None
                 self.grp_ops.setEnabled(True)
-                
-                self.working_model_id = None
-                self.reload_working_model()
-                
+
                 self.lbl_status.setText(f"Loaded: {name_part}_modified.cif")
                 self.txt.clear(); self.txt.append(f"Created CIF working copy from {model.name}")
                 self.process_cif(working)
-                
+
                 self.populate_models()
                 for i in range(self.cmb_models.count()):
                     m = self.cmb_models.itemData(i)
@@ -3388,7 +4361,7 @@ def open_chain_modifier():
                 self._load_in_progress = False
 
         def recalc(self):
-            if self.working_structure: 
+            if self.working_structure:
                 if not self.sync_viewer_to_structure():
                     return
                 QTimer.singleShot(10, lambda: self.process_cif(self.working_structure))
@@ -3398,7 +4371,8 @@ def open_chain_modifier():
                 idx = int(url.toString())
                 if 0 <= idx < len(self.layers_result):
                     self.cvs.plot_chains(self.chains_data_plot, label_ids=set(self.layers_result[idx]['chains']), preserve_view=True, waters=getattr(self, 'current_waters', []), ions=getattr(self, 'current_ions', []))
-            except: pass
+            except (ValueError, IndexError) as exc:
+                self.operation_log('Layer selection failed: ' + str(exc))
 
         def open_trim_dialog(self):
             if not self.layers_result: return
@@ -3448,7 +4422,7 @@ def open_chain_modifier():
                     if i==0: high_ids.update(lay['chains'])
                 self.txt.setHtml("<br>".join(h_lines))
                 self.cvs.plot_chains(self.chains_data_plot, label_ids=high_ids, waters=waters, ions=ions)
-                
+
                 if hasattr(self, 'trim_dialog') and self.trim_dialog and self.trim_dialog.isVisible():
                     self.trim_dialog.update_data(self.layers_result, self.full_cif_data, self.loaded_filename)
 
@@ -3457,8 +4431,8 @@ def open_chain_modifier():
                 self.detection_result = None
                 self.txt.append(str(e))
 
-    class PDBLayerIdentifier(QWidget):
-        
+    class PDBLayerIdentifier(WorkingModelMixin, QWidget):
+
 
         def __init__(self, tool_instance, session):
             super().__init__()
@@ -3466,15 +4440,15 @@ def open_chain_modifier():
             self.session = session
             self.working_model_id = None
             self._reload_in_progress = False
-            self.final_sandwiches = [] 
-            self.detected_layers = 0 
+            self.final_sandwiches = []
+            self.detected_layers = 0
             self.detected_units = 0
             self.layers_per_unit = 1
             self.detection_result = None
-            self._last_model_ids = set() 
-            
+            self._last_model_ids = set()
 
-            self.working_structure = None 
+
+            self.working_structure = None
             self.original_filename_display = ""
             self.initUI()
 
@@ -3491,12 +4465,12 @@ def open_chain_modifier():
             self.cmb_models.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
             self.populate_models()
             hb_load.addWidget(self.cmb_models)
-            
+
             self.auto_refresh_timer = QTimer(self)
             self.auto_refresh_timer.timeout.connect(self.populate_models)
             self.auto_refresh_timer.timeout.connect(self.check_live_edits)
             self.auto_refresh_timer.start(1000)
-            
+
             self.btn_load_model = QPushButton('Load Model')
             self.btn_load_model.clicked.connect(self.load_from_chimerax)
             hb_load.addWidget(self.btn_load_model)
@@ -3507,10 +4481,19 @@ def open_chain_modifier():
             layout.addLayout(hb_load)
 
             self.grp_ops = QGroupBox("Operations")
-            self.grp_ops.setEnabled(False) 
+            self.grp_ops.setEnabled(False)
             v_ops = QVBoxLayout()
             v_ops.setSpacing(2)
             v_ops.setContentsMargins(4, 10, 4, 4)
+
+            def add_section_separator():
+                line = QFrame()
+                line.setFrameShape(QFrame.Shape.HLine)
+                line.setFixedHeight(1)
+                line.setStyleSheet('background-color: #555; border: none;')
+                v_ops.addSpacing(4)
+                v_ops.addWidget(line)
+                v_ops.addSpacing(4)
 
             hb_trim = QHBoxLayout()
             self.btn_trim = QPushButton("Trim/Expand Layers")
@@ -3532,18 +4515,19 @@ def open_chain_modifier():
 
             hb_trim.addStretch()
             v_ops.addLayout(hb_trim)
+            add_section_separator()
 
             hb_pf_trim = QHBoxLayout()
-            
+
             self.btn_remove_pf = QPushButton("Trim")
             self.btn_remove_pf.setFixedWidth(70)
-            self.btn_remove_pf.setToolTip("Trim away the selected protofilament entirely")
+            self.btn_remove_pf.setToolTip("Trim away the protein protofilament or ligand site shown in the dropdown. Selection mode only affects Select.")
             self.btn_remove_pf.clicked.connect(self.action_remove_pf)
             hb_pf_trim.addWidget(self.btn_remove_pf)
 
             self.btn_select_pf = QPushButton("Select")
             self.btn_select_pf.setFixedWidth(70)
-            self.btn_select_pf.setToolTip("Left-click to select this protofilament; right-click to deselect it.")
+            self.btn_select_pf.setToolTip("Select this protein protofilament or ligand site using the mode below; right-click to subtract it.")
             self.btn_select_pf.clicked.connect(self.action_select_pf)
             self.btn_select_pf.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
             self.btn_select_pf.customContextMenuRequested.connect(lambda _pos: self.action_select_pf(deselect=True))
@@ -3551,9 +4535,48 @@ def open_chain_modifier():
 
             self.cmb_protofilaments = QComboBox()
             self.cmb_protofilaments.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+            self.cmb_protofilaments.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
+            self.cmb_protofilaments.setMinimumContentsLength(18)
             hb_pf_trim.addWidget(self.cmb_protofilaments, 1)
-            
+
             v_ops.addLayout(hb_pf_trim)
+
+            hb_selection = QHBoxLayout()
+            hb_selection.setSpacing(3)
+            hb_selection.addWidget(QLabel("Selection:"))
+            self.selection_modes = QButtonGroup(self)
+            self.selection_modes.setExclusive(True)
+            for mode, label, tip in (
+                    ('new', 'New', 'Replace the current selection with this target.'),
+                    ('add', 'Add', 'Add this target to the current selection.'),
+                    ('subtract', 'Subtract', 'Remove this target from the current selection.'),
+                    ('intersect', 'Intersect', 'Keep only selected atoms that also belong to this target.')):
+                button = QPushButton()
+                button.setIcon(selection_mode_icon(mode))
+                button.setIconSize(QSize(24, 24))
+                button.setFixedSize(34, 30)
+                button.setAccessibleName(label + ' selection')
+                button.setCheckable(True)
+                button.setProperty('selection_mode', mode)
+                button.setToolTip(label + ' selection: ' + tip + ' Applies when you click Select.')
+                button.setStyleSheet('''
+                    QPushButton { padding: 2px; }
+                    QPushButton:checked, QPushButton:pressed {
+                        background-color: #3e3e42;
+                        color: #d4d4d4;
+                        border: 1px solid #3e3e42;
+                    }
+                    QPushButton:hover {
+                        background-color: #4e4e52;
+                        border: 1px solid #98c379;
+                    }
+                ''')
+                self.selection_modes.addButton(button)
+                button.setChecked(mode == 'new')
+                hb_selection.addWidget(button)
+            hb_selection.addStretch()
+            v_ops.addLayout(hb_selection)
+            add_section_separator()
 
             hb_ren = QHBoxLayout()
             self.btn_rename = QPushButton("Rename Chains")
@@ -3571,17 +4594,20 @@ def open_chain_modifier():
             v_ops.addWidget(self.chk_only_numbers)
             self.chk_numbers_first.toggled.connect(lambda state: state and self.chk_only_numbers.setChecked(False))
             self.chk_only_numbers.toggled.connect(lambda state: state and self.chk_numbers_first.setChecked(False))
+            add_section_separator()
 
             self.btn_beta = QPushButton("Re-evaluate β-sheet structure")
             self.btn_beta.clicked.connect(self.action_evaluate_beta)
-            self.btn_beta.setEnabled(False) 
+            self.btn_beta.setEnabled(False)
             v_ops.addWidget(self.btn_beta)
-            
+            add_section_separator()
+
 
             hb_res = QHBoxLayout()
-            self.btn_restrain = QPushButton("Generate Restrain File")
+            self.btn_restrain = QPushButton("Generate Restraint File")
             self.btn_restrain.clicked.connect(self.action_restrain)
             hb_res.addWidget(self.btn_restrain)
+            self.btn_restrain.setToolTip('Use current chain IDs in this working model; review the generated model-specific ISOLDE commands before running them.')
             hb_res.addWidget(QLabel("(Export .cxc File)"))
             v_ops.addLayout(hb_res)
 
@@ -3594,28 +4620,29 @@ def open_chain_modifier():
             params_layout.setContentsMargins(4, 10, 4, 4)
             params_layout.setVerticalSpacing(2)
 
-            def create_param_input(default_val, tooltip_msg, is_int=False):
+            def create_param_input(default_val, tooltip_msg):
                 line_edit = QLineEdit()
                 line_edit.setText(str(default_val))
-                if is_int: line_edit.setValidator(QIntValidator())
-                else: line_edit.setValidator(QDoubleValidator())
-                line_edit.editingFinished.connect(self.on_param_change) 
-                line_edit.setToolTip(tooltip_msg) 
+                line_edit.setValidator(QDoubleValidator())
+                line_edit.editingFinished.connect(self.on_param_change)
+                line_edit.setToolTip(tooltip_msg)
                 return line_edit
 
-            self.edit_z_min = create_param_input(4.6, "Minimum vertical distance to be considered as a layer stack")
-            params_layout.addRow("Z Shift Min (Å):", self.edit_z_min)
-            self.edit_z_max = create_param_input(5.0, "Maximum vertical distance to be considered as a layer stack")
-            params_layout.addRow("Z Shift Max (Å):", self.edit_z_max)
-            self.edit_xy_limit = create_param_input(3.0, "Maximum horizontal drift allowed between stacked subunits, increase this number if your amino acids extend too long from fibril axis")
-            params_layout.addRow("XY Shift Limit (Å):", self.edit_xy_limit)
-            self.edit_neighbor_count = create_param_input(6, "How many closest chains to search for stacking each time", is_int=True)
-            params_layout.addRow("Neighbor Search Count:", self.edit_neighbor_count)
-            for field in (self.edit_z_min, self.edit_z_max, self.edit_xy_limit, self.edit_neighbor_count):
-                field.hide()
-                params_layout.labelForField(field).hide()
-            self.edit_water_z = create_param_input(4.0, "Maximum vertical distance from the protein layer centroids for a water/ion to be included")
-            params_layout.addRow("Water/Ion Axial Limit:", self.edit_water_z)
+            self._water_z_auto = True
+            self.edit_water_z = create_param_input(4.0, "")
+            self.edit_water_z.validator().setBottom(0.0)
+            self.edit_water_z.textEdited.connect(self.on_water_limit_edited)
+            self.btn_water_auto = QPushButton("Auto")
+            self.btn_water_auto.setStyleSheet('QPushButton { padding: 2px 6px; }')
+            self.btn_water_auto.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
+            self.btn_water_auto.clicked.connect(self.apply_auto_water_limit)
+            water_row = QHBoxLayout()
+            water_row.setContentsMargins(0, 0, 0, 0)
+            water_row.setSpacing(4)
+            water_row.addWidget(self.edit_water_z, 1)
+            water_row.addWidget(self.btn_water_auto)
+            params_layout.addRow("Water/Ion Axial Limit (Å):", water_row)
+            self.update_water_axial_limit()
 
             self.grp_params.setLayout(params_layout)
 
@@ -3653,7 +4680,7 @@ def open_chain_modifier():
             splitter = QSplitter(Qt.Orientation.Horizontal)
             splitter.addWidget(left_widget)
             splitter.addWidget(right_widget)
-            
+
             splitter.setStretchFactor(0, 4)
             splitter.setStretchFactor(1, 6)
 
@@ -3677,13 +4704,13 @@ def open_chain_modifier():
             dialog = QDialog(self)
             dialog.setWindowTitle("Fit to Map Options")
             layout = QVBoxLayout(dialog)
-            
+
             layout.addWidget(QLabel("Select the target map (.mrc):"))
             combo = QComboBox()
             for v in vols:
                 combo.addItem(f"#{v.id_string} {v.name}", userData=v.id_string)
             layout.addWidget(combo)
-            
+
             layout.addWidget(QLabel("Select fitting mode:"))
             from PyQt6.QtWidgets import QRadioButton
             radio_whole = QRadioButton("Fit as a whole")
@@ -3691,10 +4718,10 @@ def open_chain_modifier():
             radio_chain = QRadioButton("Fit as per chain")
             radio_chain.setToolTip("Fits individual chains after trimming. Automatic map fitting is skipped during expansion to preserve the existing structure.")
             radio_whole.setChecked(True)
-            
+
             layout.addWidget(radio_whole)
             layout.addWidget(radio_chain)
-            
+
             btn_box = QHBoxLayout()
             btn_ok = QPushButton("OK")
             btn_ok.clicked.connect(dialog.accept)
@@ -3711,16 +4738,35 @@ def open_chain_modifier():
                 self.chk_fit_map.blockSignals(True)
                 self.chk_fit_map.setChecked(False)
                 self.chk_fit_map.blockSignals(False)
-        
-        def sync_viewer_to_structure(self):
-            if self.working_model_id and self.working_structure:
-                try:
-                    sync_structure_from_chimerax(self.session, self.working_model_id, self.working_structure)
-                except Exception as exc:
-                    self.session.logger.error('Coordinate synchronization stopped: ' + str(exc))
-                    return False
-            return True
 
+
+        def on_water_limit_edited(self, text):
+            self._water_z_auto = False
+            self.update_water_axial_limit()
+
+        def apply_auto_water_limit(self):
+            self._water_z_auto = True
+            self.update_water_axial_limit()
+            self.on_param_change()
+
+        def update_water_axial_limit(self):
+            limit = automatic_water_axial_limit(self.detection_result)
+            if self._water_z_auto and limit is not None:
+                # The displayed number is also the value used by editing operations.
+                self.edit_water_z.setText(f'{limit:.3f}')
+            tip = ('Maximum axial distance from protein-chain centers for associated molecules.\n'
+                   'Suggested: half the detected layer spacing + 10% fluctuation tolerance '
+                   '(layer spacing × 0.5 × 1.10).\n'
+                   'Auto uses the median physical layer spacing across protofilaments. '
+                   'Edit the value to override it; click Auto to recalculate and reapply.')
+            if limit is None:
+                tip += '\nLayer spacing is unavailable; the displayed value is kept (initial fallback: 4.0 Å).'
+            else:
+                tip += f'\nDetected spacing: {limit / 0.55:.3f} Å; suggested limit: {limit:.3f} Å.'
+            tip += '\nMode: ' + ('Automatic' if self._water_z_auto else 'Manual') + '.'
+            self.edit_water_z.setToolTip(tip)
+            self.btn_water_auto.setEnabled(limit is not None)
+            self.btn_water_auto.setToolTip(tip)
 
         def on_param_change(self):
             if self.working_structure:
@@ -3732,8 +4778,8 @@ def open_chain_modifier():
         def get_param(self, widget, default):
             try: return float(widget.text())
             except ValueError: return default
-        
-        def get_kept_heteroatoms(self, keep_layer_indices, xy_limit, water_z_limit):
+
+        def get_kept_heteroatoms(self, keep_layer_indices, water_z_limit):
             if not self.working_structure or not self.final_sandwiches:
                 return set()
             editor = StructureEditor(self.working_structure)
@@ -3757,7 +4803,7 @@ def open_chain_modifier():
                                 return
                             self.process_pdb(self.working_structure)
                         break
-                
+
                 if not found:
                     self.working_model_id = None
                     self.working_structure = None
@@ -3766,197 +4812,120 @@ def open_chain_modifier():
                     self.mol_canvas.axes.axis('off')
                     self.mol_canvas.draw()
                     self.text_area.append("\n>>> Working model was closed in ChimeraX. Tool cleared.")
-            except Exception:
-                pass
+            except Exception as exc:
+                message = 'Live model refresh failed: ' + str(exc)
+                if message != getattr(self, '_last_refresh_error', None):
+                    self.session.logger.warning(message)
+                    self._last_refresh_error = message
 
-        def populate_models(self):
-            from chimerax.atomic import AtomicStructure
-            current_models = self.session.models.list(type=AtomicStructure)
-            current_ids = {(m.id_string, id(m)) for m in current_models}
-            
-            if current_ids != self._last_model_ids:
-                current_sel = self.cmb_models.currentData()
-                try:
-                    current_sel_id = current_sel.id_string if current_sel and not getattr(current_sel, 'deleted', False) else None
-                except Exception:
-                    current_sel_id = None
-                
-                if not current_sel_id and getattr(self, 'working_model_id', None):
-                    current_sel_id = self.working_model_id
-                
-                self.cmb_models.blockSignals(True)
-                self.cmb_models.clear()
-                
-                for model in current_models:
-                    item_text = f"#{model.id_string} {model.name}"
-                    self.cmb_models.addItem(item_text, userData=model)
-                    self.cmb_models.setItemData(self.cmb_models.count() - 1, item_text, Qt.ItemDataRole.ToolTipRole)
-                
-                if current_sel_id:
-                    for i in range(self.cmb_models.count()):
-                        m = self.cmb_models.itemData(i)
-                        if m and getattr(m, 'id_string', '') == current_sel_id:
-                            self.cmb_models.setCurrentIndex(i)
-                            break
-                            
-                self.cmb_models.blockSignals(False)
-                self._last_model_ids = current_ids
 
         def load_from_chimerax(self):
             model = self.cmb_models.currentData()
             if not model: return
             self._load_in_progress = True
             try:
-                self._axis_reference = None
                 self._shown_source_notices = set()
                 self.original_filename_display = model.name
-                
-                name_part, ext = os.path.splitext(self.original_filename_display)
+
+                name_part, _ = os.path.splitext(self.original_filename_display)
                 is_cif = structure_model_format(model) == 'cif'
                 save_ext = ".cif" if is_cif else ".pdb"
                 save_format = "mmcif" if is_cif else "pdb"
-                
+
                 working = StructureBuffer(f"{name_part}_modified{save_ext}")
-                
+
                 create_structure_working_copy(self.session, model, working, save_format)
-                self.working_structure = working
+                if not self.commit_working_structure(working, new_model=True):
+                    return
+                self._axis_reference = None
+                self._water_z_auto = True
+                self.edit_water_z.setText('4.0')
                 self.grp_ops.setEnabled(True)
-                
-                self.working_model_id = None 
-                
-                self.reload_working_model()
+
                 self.text_area.clear()
                 self.text_area.append(f"Created {'mmCIF' if is_cif else 'PDB'} working copy from {model.name}")
                 self.check_spatial_and_id_duplicates(self.working_structure)
                 self.process_pdb(self.working_structure)
-                
+
                 self.populate_models()
                 for i in range(self.cmb_models.count()):
                     m = self.cmb_models.itemData(i)
                     if m and getattr(m, 'id_string', '') == self.working_model_id:
                         self.cmb_models.setCurrentIndex(i)
                         break
-                        
+
             except Exception as e:
                 self.text_area.append(f"Load Error: {e}")
             finally:
                 self._load_in_progress = False
 
-        def reload_working_model(self):
-            if not self.working_structure:
-                return False
-
-            target_id = self.working_model_id
-            
-            from chimerax.core.commands import run
-            from chimerax.atomic import AtomicStructure
-
-            self._reload_in_progress = True
-            try:
-                try: run(self.session, "view name chimerax_modifier_locked_view")
-                except: pass
-
-                # Validate the replacement before closing the current model.
-                try:
-                    models = replace_structure_buffer(self.session, self.working_structure, target_id)
-                except Exception as e:
-                    self.text_area.append(f"\nModel reload failed; previous model kept: {e}")
-                    return False
-
-                def first_atomic_model(value):
-                    if isinstance(value, AtomicStructure):
-                        return value
-                    if isinstance(value, (list, tuple)):
-                        for item in value:
-                            model = first_atomic_model(item)
-                            if model is not None:
-                                return model
-                    return None
-
-                first_model = first_atomic_model(models)
-                if first_model is None or not hasattr(first_model, 'id_string'):
-                    self.text_area.append("\nModel reload failed; previous model kept: no atomic structure was opened.")
-                    return False
-
-                new_model_id = first_model.id_string
-                self.working_model_id = new_model_id
-                self._last_live_atom_count = len(first_model.atoms) if hasattr(first_model, 'atoms') else 0
-
-                return True
-            finally:
-                try: run(self.session, "view chimerax_modifier_locked_view")
-                except: pass
-                self._reload_in_progress = False
 
         def action_remove_pf(self):
             if not self.working_structure or not self.final_sandwiches: return
             if self.cmb_protofilaments.count() == 0: return
-            
+
             if not self.sync_viewer_to_structure():
                 return
             try:
-                pf_index = self.cmb_protofilaments.currentData()
+                target = self.cmb_protofilaments.currentData()
+                if target is None: return
+                if target['kind'] == 'ligand':
+                    editor = StructureEditor(self.working_structure)
+                    trim_ligand_target(editor, target)
+                    edited = StructureBuffer(self.working_structure.name)
+                    editor.write(edited, format=self.working_structure.format)
+                    if self.commit_working_structure(edited):
+                        self.text_area.append('\n>>>> Trimmed ' + target['label'])
+                        self.process_pdb(self.working_structure)
+                    return
+                pf_index = target['pf']
                 if pf_index is None or pf_index < 0 or pf_index >= len(self.final_sandwiches): return
-                
+
                 total_layers = self.detected_units
                 keep_chains = set()
-                
+
                 for i, sandwich in enumerate(self.final_sandwiches):
                     if i != pf_index:
                         for chain_id in sandwich:
                             keep_chains.add(chain_id)
-                            
+
                 if not keep_chains:
                     QMessageBox.warning(self, "Warning", "Cannot remove the last remaining protofilament.")
                     return
-                
+
                 mid_chain = self.final_sandwiches[pf_index][len(self.final_sandwiches[pf_index])//2]
                 self.text_area.append(f"Removing Protofilament with middle chain {mid_chain}...")
-                
+
                 edited = StructureBuffer(self.working_structure.name)
                 valid_layer_indices = range(total_layers)
-                xy_lim = self.get_param(self.edit_xy_limit, 3.0)
                 water_z_limit = self.get_param(self.edit_water_z, 4.0)
-                
-                keep_het_lines = self.get_kept_heteroatoms(valid_layer_indices, xy_lim, water_z_limit)
-                
+
+                keep_het_lines = self.get_kept_heteroatoms(valid_layer_indices, water_z_limit)
+
                 if self.working_structure.format == 'cif':
                     self.write_trimmed_cif(self.working_structure, edited, keep_chains, keep_het_lines)
                 else:
                     self.write_trimmed_pdb(self.working_structure, edited, keep_chains, keep_het_lines)
-                    
-                self.working_structure.copy_from(edited)
-                self.text_area.append("\n>>>> Applied Protofilament Trimming")
-                
-                if not self.reload_working_model():
+
+                if not self.commit_working_structure(edited):
                     self.text_area.append("\nThe edit was prepared, but the previous ChimeraX model was kept because the replacement could not be opened.")
                     return
                 self.process_pdb(self.working_structure)
-                
+
             except Exception as e:
                 QMessageBox.critical(self, "Error", f"Action failed: {e}")
 
         def action_select_pf(self, checked=False, *, deselect=False):
             if not getattr(self, 'working_model_id', None) or not getattr(self, 'final_sandwiches', []): return
             if self.cmb_protofilaments.count() == 0: return
-            
+
             try:
-                pf_index = self.cmb_protofilaments.currentData()
-                if pf_index is None or pf_index < 0 or pf_index >= len(self.final_sandwiches): return
-                
-                target_sandwich = self.final_sandwiches[pf_index]
-                if not target_sandwich: return
-                
-                chain_str = ",".join(target_sandwich)
-                from chimerax.core.commands import run
-                
-                if deselect:
-                    run(self.session, f"select subtract #{self.working_model_id}/{chain_str}")
-                else:
-                    run(self.session, f"select #{self.working_model_id}/{chain_str}")
-                verb = 'Deselected' if deselect else 'Selected'
-                self.text_area.append(f"\n>>>> {verb} Protofilament with chains: {chain_str}")
-                
+                target = self.cmb_protofilaments.currentData()
+                if target is None: return
+                mode = 'subtract' if deselect else self.selection_modes.checkedButton().property('selection_mode')
+                count = select_protofilament_target(self.session, self.working_model_id, target, mode)
+                self.text_area.append(f'\n>>>> {mode.capitalize()} selection: {target["label"]} ({count} target atoms)')
+
             except Exception as e:
                 QMessageBox.critical(self, "Error", f"Selection failed: {e}")
 
@@ -3967,16 +4936,15 @@ def open_chain_modifier():
             try:
                 old_sandwiches = self.final_sandwiches
                 mapping = self.create_renaming_mapping(old_sandwiches)
-                
+
                 edited = StructureBuffer(self.working_structure.name)
                 if self.working_structure.format == 'cif':
                     self.write_renamed_cif(self.working_structure, edited, self.final_sandwiches)
                 else:
                     self.write_renamed_pdb(self.working_structure, edited, self.final_sandwiches)
-                self.working_structure.copy_from(edited)
-                
+                if not self.commit_working_structure(edited):
+                    return
                 self.text_area.append("\n>>>> Applied Renaming")
-                self.reload_working_model()
                 reference = getattr(self, '_axis_reference', None)
                 if reference:
                     reference['chains'] = {mapping.get(c, c): rows for c, rows in reference['chains'].items()}
@@ -3994,6 +4962,8 @@ def open_chain_modifier():
                 detection = getattr(parent, 'detection_result', None) or {}
                 self.suggested_repeat = detection.get('suggested_repeat_units', 2 if detection.get('antiparallel') or detection.get('parent_antiparallel') else 1)
                 self.compatible_repeats = detection.get('compatible_repeat_units')
+                self.terminal_completion = terminal_completion_supported(detection)
+                self.completion_count = sum(current_layers - t['units'] for t in detection.get('protofilaments', [])) if self.terminal_completion else 0
                 rises = [track['unit_rise'] for track in detection.get('protofilaments', [])
                          if track.get('unit_rise') is not None]
                 self.manual_rise = float(np.median(rises)) if rises else 4.8 * self.unit_layers
@@ -4004,9 +4974,21 @@ def open_chain_modifier():
                 layout = QVBoxLayout(self)
                 layout.setContentsMargins(12, 12, 12, 12)
                 layout.setSpacing(10)
-                self.chk_auto = QCheckBox("Auto Computing")
+                if self.terminal_completion:
+                    note = QLabel(f"Complete shorter protofilaments first: add {self.completion_count} modeled terminal chains so every stack has {self.current_layers} layers.\n"
+                                  f"Completion uses the measured {self.suggested_repeat}-chain repeat and preserves existing atoms and strand orientations. The end is chosen to balance the shorter stack against the longer stacks.\n"
+                                  "Then expand the completed assembly using the settings below. Added chains and ends will be listed in the log.")
+                    note.setWordWrap(True)
+                    layout.addWidget(note)
+                self.chk_auto = QCheckBox("Compute Twist/Rise")
+                self.chk_auto.setStyleSheet("QCheckBox:disabled { color: #808080; } QCheckBox::indicator:disabled { border-color: #555; background-color: #303030; }")
                 self.chk_auto.setChecked(True)
-                layout.addWidget(self.chk_auto)
+                # The enabled row also supplies the tooltip when its checkbox is disabled.
+                self.auto_row = QWidget()
+                auto_layout = QHBoxLayout(self.auto_row)
+                auto_layout.setContentsMargins(0, 0, 0, 0)
+                auto_layout.addWidget(self.chk_auto)
+                layout.addWidget(self.auto_row)
 
                 period_form = QFormLayout()
                 self.edit_period = QLineEdit(str(self.suggested_repeat))
@@ -4016,9 +4998,8 @@ def open_chain_modifier():
                 layout.addLayout(period_form)
 
                 self.chk_compute_axis = QCheckBox("Compute Helical Axis")
-                self.chk_compute_axis.setToolTip("Use the source stacking direction. When unchecked, use the global Z axis; align the structure with Z first.")
+                self.chk_compute_axis.setToolTip("Checked: derive the axis from source repeats. With only one source unit, estimate the layer normal from C-alpha PCA (the smallest-eigenvalue direction, perpendicular to the broadest PCA projection). This shape estimate cannot determine a true repeat axis or its polarity. Unchecked: use the global Z axis; align the structure with Z first.")
                 self.chk_compute_axis.setChecked(self.current_layers > 1)
-                self.chk_compute_axis.stateChanged.connect(self.on_compute_axis_changed)
                 layout.addWidget(self.chk_compute_axis)
 
                 form_layout = QFormLayout()
@@ -4041,11 +5022,17 @@ def open_chain_modifier():
                 self.availability_note.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Minimum)
                 layout.addWidget(self.availability_note)
 
-                self.btn_expand = QPushButton("Expand")
+                self.chk_run_dssp = QCheckBox("Run DSSP")
+                self.chk_run_dssp.setChecked(True)
+                self.chk_run_dssp.setToolTip("Recalculate secondary structure after expansion.")
+                layout.addWidget(self.chk_run_dssp)
+
+                self.btn_expand = QPushButton("Complete && Expand" if self.terminal_completion else "Expand")
                 self.btn_expand.clicked.connect(self.accept)
                 layout.addWidget(self.btn_expand)
                 self.setMinimumWidth(max(520, self.fontMetrics().horizontalAdvance("Alternating period (chain units):") + 210))
                 self.chk_auto.stateChanged.connect(self.toggle_manual)
+                self.chk_compute_axis.stateChanged.connect(self.toggle_manual)
                 self.edit_period.textChanged.connect(self.toggle_manual)
                 self.toggle_manual()
 
@@ -4055,10 +5042,6 @@ def open_chain_modifier():
                 except ValueError:
                     return None
 
-            def on_compute_axis_changed(self, state):
-                if self.chk_compute_axis.isChecked() and self.current_layers <= 1:
-                    QMessageBox.warning(self, "Reminder", "Only one chain unit per stack is available; a repeat axis cannot be computed from neighboring units.")
-
             def toggle_manual(self):
                 period = self.alternating_period()
                 randomize = period is not None and period <= 0
@@ -4066,6 +5049,18 @@ def open_chain_modifier():
                 compatible = self.compatible_repeats is None or effective in self.compatible_repeats
                 valid = effective is not None and 0 < effective <= self.current_layers and compatible
                 auto_available = valid and self.current_layers > effective
+                auto_tip = ('Fit twist and rise per chain unit from equivalent positions in the source repeat. '
+                            'When unchecked, use the entered twist and rise. ')
+                if self.current_layers <= 1:
+                    auto_tip += 'Unavailable: only one source chain unit per stack is present; at least two are needed to measure twist/rise.'
+                elif not valid:
+                    auto_tip += 'Unavailable: enter a compatible alternating period supported by the source units.'
+                elif not auto_available:
+                    auto_tip += f'Unavailable: a {effective}-unit repeat needs at least {effective + 1} source units to measure twist/rise.'
+                else:
+                    auto_tip += f'The selected {effective}-unit repeat needs at least {effective + 1} source units.'
+                self.chk_auto.setToolTip(auto_tip)
+                self.auto_row.setToolTip(auto_tip)
                 self.chk_auto.setEnabled(auto_available)
                 if not auto_available and self.chk_auto.isChecked():
                     self.chk_auto.blockSignals(True)
@@ -4091,16 +5086,21 @@ def open_chain_modifier():
                     pattern = f'Repeat every {period} chain {unit_word} ({period * self.unit_layers} layers)'
                 else:
                     pattern = 'Enter a whole number; 0 or any negative number selects random.'
+                axis_note = ''
+                if self.current_layers <= 1:
+                    axis_note = ('\n\nAxis: estimated from the single-unit shape (C-alpha PCA plane normal). '
+                                 'Repeat direction and polarity cannot be measured from one unit.'
+                                 if self.chk_compute_axis.isChecked() else '\n\nAxis: global Z.')
                 self.parameter_note.setText(
                     f'Current structure:\nOne chain unit spans {self.unit_layers} physical {layer_word}\n\n'
-                    f'Alternating pattern:\n{pattern}')
+                    f'Alternating pattern:\n{pattern}{axis_note}')
                 availability = ''
                 if effective is not None and effective > self.current_layers:
                     availability = f'At least {effective} source units are needed to include every template.'
                 elif effective is not None and not compatible:
                     availability = 'This period would exchange different proteins or opposite strand orientations. Choose a compatible alternating period.'
                 elif not auto_available and valid:
-                    availability = f'Automatic mode needs at least {effective + 1} source units. Enter manual parameters for this fragment.'
+                    availability = f'Compute Twist/Rise needs at least {effective + 1} source units. Enter manual twist and rise for this fragment.'
                 self.availability_note.setText(availability)
                 self.availability_note.setVisible(bool(availability))
                 self.edit_twist.setStyleSheet("color: gray;" if is_auto else "")
@@ -4133,6 +5133,7 @@ def open_chain_modifier():
                         return
                 self.options = dict(use_auto=automatic, repeat_units=self.alternating_period(),
                                     use_computed_axis=self.chk_compute_axis.isChecked(),
+                                    run_dssp=self.chk_run_dssp.isChecked(),
                                     manual_twist=twist, manual_rise=rise)
                 super().accept()
 
@@ -4176,62 +5177,61 @@ def open_chain_modifier():
             except ValueError:
                 QMessageBox.warning(self, "Invalid Input", "Please enter a valid integer for Target Layers.")
                 return
-                
+
             total_layers = self.detected_layers
             unit_layers = self.layers_per_unit or 1
             total_units = self.detected_units
-            
+
             if target_layers <= 0:
                 QMessageBox.warning(self, "Invalid Input", "Keep at least one layer.")
                 return
 
-            if target_layers == total_layers:
+            needs_completion = bool(self.detection_result and not self.detection_result['complete'])
+            can_complete = terminal_completion_supported(self.detection_result)
+            if target_layers == total_layers and not needs_completion:
                 self.text_area.append(f"\nYour model is already having {total_layers} layer(s)")
                 return
-            if self.detection_result and not self.detection_result['complete']:
-                QMessageBox.warning(self, "Incomplete stacks", "The detected stacks have missing units, unequal lengths or different layer multiplicities. Whole-assembly trimming/expansion requires complete matching stacks.")
+            if needs_completion and not (can_complete and target_layers >= total_layers):
+                QMessageBox.warning(self, "Incomplete stacks", "Automatic terminal completion requires contiguous stacks with a supported orientation motif and one layer per chain. Parallel stacks need at least two chains and may lack up to two terminal chains; other supported motifs need at least three chains and may lack one. Choose a target at least as large as the longest stack. Internal gaps and ambiguous stacks cannot be completed automatically.")
                 return
             if target_layers % unit_layers:
                 QMessageBox.warning(self, "Whole chain units required", f"Each chain forms {unit_layers} layers. Choose a multiple of {unit_layers}; this operation keeps chains intact.")
                 return
             target_units = target_layers // unit_layers
-            
+
             try:
                 edited = StructureBuffer(self.working_structure.name)
-                
+
                 if target_layers < total_layers:
                     start_idx = (total_units - target_units) // 2
                     end_idx = start_idx + target_units
                     valid_layer_indices = range(start_idx, end_idx)
-                    
+
                     keep_chains = set()
                     for sandwich in self.final_sandwiches:
                         for i, chain_id in enumerate(sandwich):
                             if i in valid_layer_indices: keep_chains.add(chain_id)
-                    
+
                     self.text_area.append("Calculating water/ion retention based on layer centroids...")
-                    xy_lim = self.get_param(self.edit_xy_limit, 3.0)
                     water_z_limit = self.get_param(self.edit_water_z, 4.0)
-                    keep_het_lines = self.get_kept_heteroatoms(valid_layer_indices, xy_lim, water_z_limit)
-                    
+                    keep_het_lines = self.get_kept_heteroatoms(valid_layer_indices, water_z_limit)
+
                     if self.working_structure.format == 'cif':
                         self.write_trimmed_cif(self.working_structure, edited, keep_chains, keep_het_lines)
                     else:
                         self.write_trimmed_pdb(self.working_structure, edited, keep_chains, keep_het_lines)
-                    self.working_structure.copy_from(edited)
-                    self.text_area.append(f"\n>>>> Applied Trimming (Kept middle {target_layers} layers + associated waters)")
-                
+
                 else:
                     if self.working_structure.format != 'cif':
                         current_atoms = getattr(self, '_last_live_atom_count', 0)
                         if current_atoms > 0 and total_layers > 0:
                             estimated_atoms = (current_atoms / total_layers) * target_layers
                             estimated_chains = (len(self.results) / total_layers) * target_layers
-                            
+
                             if estimated_atoms > 99999 or estimated_chains > 3906:
                                 QMessageBox.warning(
-                                    self, 
-                                    "PDB Limit Exceeded", 
+                                    self,
+                                    "PDB Limit Exceeded",
                                     "The expanded model will exceed the maximum number of atoms (99,999) or chain IDs (at most 2 characters in extended PDB mode) a PDB file can hold. Please convert the current model to CIF format and proceed."
                                 )
                                 return
@@ -4252,39 +5252,41 @@ def open_chain_modifier():
                     manual_twist = expansion_options['manual_twist']
                     manual_rise = expansion_options['manual_rise']
 
-                    self.text_area.append("Calculating expansion transformations...")
+                    if needs_completion:
+                        count = sum(total_units - len(s) for s in self.final_sandwiches)
+                        self.text_area.append(f"Completing shorter stacks: modeling {count} terminal chain copies before expansion.")
                     layers_to_add = target_units - total_units
                     water_z_limit = self.get_param(self.edit_water_z, 4.0)
                     if self.working_structure.format == 'cif':
                         applied_twist, applied_rise, applied_axis, tilt_deg = self.write_expanded_cif(self.working_structure, edited, layers_to_add, use_auto, manual_twist, manual_rise, water_z_limit, use_computed_axis=use_computed_axis, repeat_units=repeat_units)
                     else:
                         applied_twist, applied_rise, applied_axis, tilt_deg = self.write_expanded_pdb(self.working_structure, edited, layers_to_add, use_auto, manual_twist, manual_rise, water_z_limit, use_computed_axis=use_computed_axis, repeat_units=repeat_units)
-                    self.working_structure.copy_from(edited)
-                    pattern = 'random' if repeat_units <= 0 else f'{repeat_units} chain units'
-                    self.text_area.append(f"\n>>>> Applied Expansion (Added {layers_to_add} chain units / {layers_to_add * unit_layers} layers per protofilament, Alternating period: {pattern})")
-                    self.text_area.append("Existing atom coordinates preserved; the shared helical transform was applied only to added copies.")
 
-                if not self.reload_working_model():
+                if not self.commit_working_structure(edited):
                     self.text_area.append("\nThe in-memory edit could not be opened; the previous ChimeraX model was kept.")
                     return
-                
-                if target_layers > total_layers and getattr(self, 'working_model_id', None):
+                self.operation_log(('Expansion' if target_layers >= total_layers else 'Trimming') +
+                                   f' complete: {target_layers} layers per protofilament.')
+
+                if (target_layers >= total_layers and expansion_options.get('run_dssp', True)
+                        and getattr(self, 'working_model_id', None)):
                     try:
-                        from chimerax.core.commands import run
-                        run(self.session, f"dssp #{self.working_model_id}")
-                        if not self.sync_viewer_to_structure():
-                            return
-                    except:
-                        pass
+                        update_secondary_structure_from_chimerax(
+                            self.session, self.working_model_id, self.working_structure)
+                        model = next(m for m in self.session.models.list()
+                                     if m.id_string == self.working_model_id)
+                        model._amyloid_structure.copy_from(self.working_structure)
+                    except Exception as exc:
+                        self.operation_log('Expansion completed; DSSP annotation failed: ' + str(exc))
 
                 self.process_pdb(self.working_structure)
-                
-                if target_layers > total_layers:
+
+                if target_layers >= total_layers:
                     self.text_area.append(f"\nApplied Twist: {applied_twist:.5f}°")
                     self.text_area.append(f"Applied Rise: {applied_rise:.5f} Å")
                     self.text_area.append(f"Helical Axis Direction: [{applied_axis[0]:.4f}, {applied_axis[1]:.4f}, {applied_axis[2]:.4f}], with {tilt_deg:.2f}° tilted from the Z-Axis")
-                
-                if target_layers > total_layers and self.chk_fit_map.isChecked():
+
+                if target_layers >= total_layers and self.chk_fit_map.isChecked():
                     self.text_area.append("Automatic Fit to Map skipped: expansion preserves existing coordinates and shared helical geometry.")
                 if target_layers < total_layers and self.chk_fit_map.isChecked() and getattr(self, 'fit_map_model_id', None) and self.working_model_id:
                     mode = getattr(self, 'fit_map_mode', 'whole')
@@ -4301,64 +5303,112 @@ def open_chain_modifier():
                         else:
                             run(self.session, f"fitmap #{self.working_model_id} inMap #{self.fit_map_model_id}")
                             self.text_area.append("Successfully fitted the entire model to map.")
-                        
+
                         if not self.sync_viewer_to_structure():
                             return
                         self.process_pdb(self.working_structure)
                     except Exception as e:
                         self.text_area.append(f"Fit to map warning/error: {e}")
-                
-            except Exception as e: 
+
+            except Exception as e:
                 QMessageBox.critical(self, "Error", f"Action failed: {e}")
 
 
-        def write_expanded_pdb(self, input_path, output_path, layers_to_add, use_auto, manual_twist, manual_rise, water_z_limit=4.0, use_alt=False, use_computed_axis=True, repeat_units=None):
+        def write_expanded_structure(self, input_path, output_path, layers_to_add, use_auto,
+                                     manual_twist, manual_rise, water_z_limit, use_alt,
+                                     use_computed_axis, repeat_units, *, format):
             editor = StructureEditor(input_path)
             result = expand_structure_layers(editor, self.final_sandwiches, layers_to_add,
                 use_auto, manual_twist, manual_rise, water_z_limit, use_alt, use_computed_axis,
                 label_generator=self.generate_label, repeat_units=repeat_units)
-            report = editor.write(output_path, format='pdb')
-            self.text_area.append('Validated expansion: {} atoms.'.format(report['atoms']))
+            report = editor.write(output_path, format=format)
+            for line in terminal_completion_messages(report):
+                self.operation_log(line)
+            for warning in report.get('automatic_fit', {}).get('warnings', []):
+                self.operation_log('Geometry warning: ' + warning)
+            overlap = report.get('overlap_check', {})
+            if overlap.get('close_pairs'):
+                self.operation_log(f"Geometry warning: {overlap['close_pairs']} C-alpha pairs across placed copies "
+                                   f"are closer than {overlap['minimum_new_separation_angstrom']:g} Å. "
+                                   'Inspect boundary contacts before using this modeled structure.')
             invalid = [k for k, v in report['metadata'].items() if v['action'] in ('invalidated', 'removed')]
             if invalid:
-                self.text_area.append('Source metadata invalidated: ' + ', '.join(invalid))
+                self.operation_log('Source metadata invalidated: ' + ', '.join(invalid))
             return result
+
+        def write_expanded_pdb(self, input_path, output_path, layers_to_add, use_auto, manual_twist, manual_rise, water_z_limit=4.0, use_alt=False, use_computed_axis=True, repeat_units=None):
+            return self.write_expanded_structure(input_path, output_path, layers_to_add, use_auto,
+                manual_twist, manual_rise, water_z_limit, use_alt, use_computed_axis, repeat_units,
+                format='pdb')
 
 
         def action_restrain(self):
-            if not self.final_sandwiches or self.detected_layers == 0: return
-            file_path, _ = QFileDialog.getSaveFileName(self, "Save Restrain File", "restrain_torsion.cxc", "ChimeraX Command (*.cxc);;All Files (*)")
-            if file_path:
-                try:
-                    mapping = self.create_renaming_mapping(self.final_sandwiches)
-                    mid_layer_idx = self.detected_units // 2 
-                    with open(file_path, 'w') as f:
-                        for sandwich in self.final_sandwiches:
-                            mid_chain_original = sandwich[mid_layer_idx]
-                            mid_id_new = mapping[mid_chain_original]
-                            for layer_k in range(len(sandwich)):
-                                if layer_k == mid_layer_idx: continue 
-                                target_chain_original = sandwich[layer_k]
-                                target_id_new = mapping[target_chain_original]
-                                f.write(f"isolde restrain torsions /{target_id_new} template /{mid_id_new} angleRange 180\n")
-                    self.text_area.append(f"\n[Export] Restrain file generated: {os.path.basename(file_path)}")
-                except Exception as e: QMessageBox.critical(self, "Error", f"Failed to save restrain file:\n{str(e)}")
-
-        def action_evaluate_beta(self):
-            if not self.working_structure or self.detected_layers <= 1: return
-            if not self.working_model_id: return
-            
-            if not self.sync_viewer_to_structure():
+            if not self.working_structure or not self.sync_viewer_to_structure():
+                return
+            self.process_pdb(self.working_structure)
+            if not self.final_sandwiches:
                 return
             try:
-                self.text_area.append(f"\n>>> Re-evaluating secondary structure using ChimeraX dssp...")
-                update_secondary_structure_from_chimerax(self.session, self.working_model_id, self.working_structure)
-                self.reload_working_model()
-                self.process_pdb(self.working_structure)
-                self.text_area.append(">>> β-sheet evaluation completed\n>>> Updated working model")
-                    
-            except Exception as e:
-                self.text_area.append(f"ChimeraX DSSP Error: {e}")
+                from chimerax.core.commands import AtomSpecArg
+                model = next(m for m in self.session.models.list()
+                             if m.id_string == self.working_model_id)
+                specs = {chain.chain_id: chain.atomspec for chain in model.chains}
+                commands = []
+                for stack in self.final_sandwiches:
+                    template = stack[len(stack) // 2]
+                    for chain_id in stack:
+                        spec = specs[chain_id]
+                        selection, _, rest = AtomSpecArg.parse(spec, self.session)
+                        atoms = selection.evaluate(self.session).atoms
+                        if (rest or not len(atoms) or
+                                any(a.structure is not model or a.residue.chain_id != chain_id for a in atoms)):
+                            raise StructureEditError('Restraint selector does not uniquely identify chain ' + chain_id)
+                        if chain_id != template:
+                            commands.append(f'isolde restrain torsions {spec} template {specs[template]} angleRange 180')
+                file_path, _ = QFileDialog.getSaveFileName(
+                    self, 'Save Restraint File', 'restrain_torsion.cxc',
+                    'ChimeraX Command (*.cxc);;All Files (*)')
+                if not file_path:
+                    return
+                header = [f'# Amyloid Modifier {VERSION}: working model #{model.id_string}',
+                          '# Chain IDs are the current IDs; no rename is implied.',
+                          '# Model numbers are session-specific. Check them before reusing this script.',
+                          '# Each stack uses its middle chain as template; review biological suitability.']
+                with open(file_path, 'w', encoding='utf-8', newline='\n') as handle:
+                    handle.write('\n'.join(header + commands) + '\n')
+                self.operation_log('Restraint file generated: ' + file_path)
+            except (OSError, ValueError, KeyError, StopIteration) as exc:
+                QMessageBox.critical(self, 'Restraint export failed', str(exc))
+
+        def action_evaluate_beta(self):
+            if not self.working_structure or self.detected_layers <= 1 or not self.working_model_id:
+                return
+            if not self.sync_viewer_to_structure():
+                return
+            model = None
+            secondary_structure = None
+            committed = False
+            try:
+                model = next(m for m in self.session.models.list()
+                             if m.id_string == self.working_model_id)
+                residues = model.residues
+                secondary_structure = (residues, residues.ss_types.copy(), residues.ss_ids.copy())
+                edited = StructureBuffer(self.working_structure.name)
+                edited.copy_from(self.working_structure)
+                update_secondary_structure_from_chimerax(self.session, self.working_model_id, edited)
+                committed = self.commit_working_structure(edited)
+                if committed:
+                    self.process_pdb(self.working_structure)
+                    self.operation_log('Secondary structure updated using ChimeraX DSSP.')
+            except Exception as exc:
+                self.operation_log('ChimeraX DSSP annotation failed: ' + str(exc))
+            finally:
+                # Native DSSP updates the displayed annotations before serialization.
+                # Restore them too if the staged buffer cannot be committed.
+                if not committed and secondary_structure is not None and not model.deleted:
+                    residues, ss_types, ss_ids = secondary_structure
+                    residues.ss_types = ss_types
+                    residues.ss_ids = ss_ids
 
         def check_spatial_and_id_duplicates(self, file_path):
             # Reject duplicate identities rather than leave ambiguous metadata references.
@@ -4373,8 +5423,6 @@ def open_chain_modifier():
             try:
                 editor = StructureEditor(filename)
                 chains, waters, ions = editor.preview()
-                for notice in new_source_notices(self, editor.report):
-                    self.text_area.append('Warning: ' + escape(notice))
                 hint = None
                 reference = getattr(self, '_axis_reference', None)
                 if reference and reference['path'] == filename:
@@ -4389,6 +5437,8 @@ def open_chain_modifier():
                         if fit is not None and fit['rmsd'] <= 1.0:
                             hint = fit['rotation'] @ np.asarray(reference['axis'])
                 result = detect_layers(chains, axis_hint=hint)
+                for notice in new_source_notices(self, editor.report):
+                    self.text_area.append('Warning: ' + escape(notice))
                 if hint is not None and reference.get('antiparallel', False) and result['orientation'] == 'undetermined':
                     result['parent_antiparallel'] = True
                     result['warnings'].append('The parent stack was antiparallel; this fragment has insufficient neighbors to recheck its orientation.')
@@ -4401,6 +5451,7 @@ def open_chain_modifier():
                     result['compatible_repeat_units'] = [p for p in result['compatible_repeat_units'] if p % 2 == 0]
                 self.detection_result = result
                 self.final_sandwiches = result['sandwiches']
+                self.update_water_axial_limit()
                 self.detected_units = result['detected_units']
                 self.detected_layers = result['detected_layers']
                 self.layers_per_unit = result['layers_per_unit']
@@ -4423,7 +5474,14 @@ def open_chain_modifier():
                 else:
                     lines.append('Stacking axis (' + result['axis_source'] + '): [' + ', '.join(f'{v:.4f}' for v in result['axis']) + ']')
                 for i, track in enumerate(result['protofilaments']):
-                    lines.append(f"\nProtofilament #{i+1} ({track['orientation']}): {track['units']} units × {track['layers_per_unit']} layers/unit = {track['layers']} layers")
+                    lines.append(f"\nProtofilament #{i+1} ({track['orientation']}): {track['units']} chain units × {track['layers_per_unit']} layers/unit = {track['layers']} layers")
+                    period = result['suggested_repeat_units']
+                    if track['orientation'] == 'antiparallel' and track['complete'] and period > 1:
+                        repeats, remainder = divmod(track['units'], period)
+                        summary = f"Repeat units: {repeats} complete × {period} chains/repeat"
+                        if remainder:
+                            summary += f" + {remainder} unpaired chain units"
+                        lines.append(summary)
                     lines.append(', '.join(track['chains']))
                     if not track['complete']:
                         lines.append(f"Unit positions: {track['unit_positions']}; axial span: {track['axial_layer_span']} layers")
@@ -4434,8 +5492,10 @@ def open_chain_modifier():
                 self.btn_beta.setEnabled(self.detected_layers > 1)
                 self.cmb_protofilaments.blockSignals(True)
                 self.cmb_protofilaments.clear()
-                for i, pf in enumerate(self.final_sandwiches):
-                    self.cmb_protofilaments.addItem(f'Protofilament with Chain {pf[len(pf)//2]}', userData=i)
+                for target in protofilament_selection_targets(editor, result, self.get_param(self.edit_water_z, 4.0)):
+                    self.cmb_protofilaments.addItem(target['label'], userData=target)
+                    self.cmb_protofilaments.setItemData(self.cmb_protofilaments.count() - 1,
+                        target['label'], Qt.ItemDataRole.ToolTipRole)
                 self.cmb_protofilaments.blockSignals(False)
                 highlights = {s[len(s)//2] for s in self.final_sandwiches}
                 self.mol_canvas.plot_chains(self.chains_data_plot, label_ids=highlights, waters=waters, ions=ions)
@@ -4443,6 +5503,7 @@ def open_chain_modifier():
                 # A failed new analysis must not leave a previous model's assignment active.
                 self.detection_result = None
                 self.final_sandwiches = []
+                self.update_water_axial_limit()
                 self.results = {}
                 self.detected_units = self.detected_layers = 0
                 self.layers_per_unit = 1
@@ -4450,14 +5511,9 @@ def open_chain_modifier():
                 self.lbl_orientation.setText('Undetermined')
                 self.cmb_protofilaments.clear()
                 self.btn_beta.setEnabled(False)
-                self.text_area.append(f'Analysis Error: {exc}')
-
-        def parse_cif_manual_logic(self, filepath):
-            return StructureEditor(filepath).preview()
-
-
-        def parse_pdb_manual_logic(self, filepath):
-            return StructureEditor(filepath).preview()
+                message = str(exc)
+                self.text_area.append(message if message == 'No C-alpha detected; detection failed.'
+                                      else f'Analysis Error: {message}')
 
 
         def get_centroid(self, chain_data):
@@ -4465,26 +5521,6 @@ def open_chain_modifier():
             coords = [res['coord'] for res in chain_data]
             return np.mean(coords, axis=0)
 
-        def check_stacking(self, chain_a, chain_b, z_min, z_max, xy_limit):
-            res_map_a = {r['id']: r['coord'] for r in chain_a}
-            res_map_b = {r['id']: r['coord'] for r in chain_b}
-            common_ids = set(res_map_a.keys()).intersection(set(res_map_b.keys()))
-            if len(common_ids) < 3: return 0
-            
-            z_diffs = []
-            for rid in common_ids:
-                pos_a, pos_b = res_map_a[rid], res_map_b[rid]
-                dx, dy, dz = pos_b[0] - pos_a[0], pos_b[1] - pos_a[1], pos_b[2] - pos_a[2]
-                if math.sqrt(dx*dx + dy*dy) > xy_limit: return 0
-                z_diffs.append(dz)
-
-            avg_dz = np.mean(z_diffs)
-            abs_dz = abs(avg_dz)
-            
-            if z_min <= abs_dz <= z_max:
-                if np.std(z_diffs) > 1.5: return 0 
-                return 1 if avg_dz > 0 else -1
-            return 0
 
         def get_expansion_order(self, n_layers):
             mid = n_layers // 2; order = [mid]; offset = 1
@@ -4511,7 +5547,7 @@ def open_chain_modifier():
                     return label
             else:
                 label = ""; index += 1
-                while index > 0: 
+                while index > 0:
                     index -= 1; label = chr(ord('A') + (index % 26)) + label; index //= 26
                 return label
 
@@ -4532,7 +5568,7 @@ def open_chain_modifier():
                     mapping[sandwich[layer]] = label
             return mapping
 
-        
+
         def write_renamed_cif(self, input_filename, output_filename, sandwiches):
             editor = StructureEditor(input_filename)
             editor.rename(self.create_renaming_mapping(sandwiches))
@@ -4549,16 +5585,9 @@ def open_chain_modifier():
 
 
         def write_expanded_cif(self, input_path, output_path, layers_to_add, use_auto, manual_twist, manual_rise, water_z_limit=4.0, use_alt=False, use_computed_axis=True, repeat_units=None):
-            editor = StructureEditor(input_path)
-            result = expand_structure_layers(editor, self.final_sandwiches, layers_to_add,
-                use_auto, manual_twist, manual_rise, water_z_limit, use_alt, use_computed_axis,
-                label_generator=self.generate_label, repeat_units=repeat_units)
-            report = editor.write(output_path, format='cif')
-            self.text_area.append('Validated expansion: {} atoms.'.format(report['atoms']))
-            invalid = [k for k, v in report['metadata'].items() if v['action'] in ('invalidated', 'removed')]
-            if invalid:
-                self.text_area.append('Source metadata invalidated: ' + ', '.join(invalid))
-            return result
+            return self.write_expanded_structure(input_path, output_path, layers_to_add, use_auto,
+                manual_twist, manual_rise, water_z_limit, use_alt, use_computed_axis, repeat_units,
+                format='cif')
 
 
         def write_renamed_pdb(self, input_filename, output_filename, sandwiches):
@@ -4576,8 +5605,6 @@ def open_chain_modifier():
             self.text_area.append('Validated trim: {} atoms.'.format(report['atoms']))
 
 
-
-    
     class DebugWidget(QWidget):
         def __init__(self, pdb_widget_instance, parent=None):
             super().__init__(parent)
