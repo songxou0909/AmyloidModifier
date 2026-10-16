@@ -1,7 +1,7 @@
 """Amyloid Modifier: structured editing, repeat geometry, and ChimeraX widgets.
 
-The implementation intentionally stays in one file. Geometry and structure I/O
-remain usable without ChimeraX; the native adapter and GUI follow those helpers.
+Geometry and structure I/O are available independently of ChimeraX. The native
+adapter and GUI integrate these operations with the ChimeraX session.
 Physical layers and chain units are distinct: expansion counts whole chain units.
 """
 
@@ -21,7 +21,7 @@ from typing import NamedTuple
 from collections import Counter, defaultdict
 
 
-VERSION = '2.1.3'
+VERSION = '2.2.1'
 # Below this per-cycle angle, a free rotation axis is dominated by coordinate
 # rounding/noise. Use the measured repeat direction to constrain the rotation.
 MIN_RESOLVED_ROTATION_DEGREES = 0.05
@@ -2204,8 +2204,8 @@ def _shared_detection_helix(candidates, axis):
         dz = float(e['vector'] @ axis)
         lateral = np.linalg.norm(e['vector'] - dz * axis)
         recovered |= lateral > max(2.0, .30 * abs(dz))
-    # Leave the established detector untouched unless the shared transform
-    # actually explains an otherwise rejected transverse displacement.
+            # Accept a rejected transverse displacement only when it agrees
+            # with the shared repeat transform.
     return (screw_axis, supported) if recovered else None
 
 
@@ -2525,9 +2525,7 @@ def _expansion_repeat_pattern(chains, sandwiches):
         return (not (pure_anti and period % 2) and
                 all(all(t[i][1] == t[i + period][1] and same_identity(t[i][0], t[i + period][0], stack[i], stack[i + period])
                         for i in range(len(t) - period)) for t, stack in zip(tags, sandwiches)))
-    # Preserve a previously usable exact-identity repeat. Partial coverage is
-    # a fallback when exact matching leaves no observed repeat to fit, not a
-    # reason to change a working structure's default templates or transform.
+    # Use partial coverage only when exact residue matching yields no repeat.
     strict_period = next((p for p in range(1, depth + 1)
                           if not (pure_anti and p % 2) and
                           all(all(t[i] == t[i + p] for i in range(len(t) - p)) for t in tags)), depth + 1)
@@ -2618,16 +2616,16 @@ def _expand_unequal_stacks(editor, sandwiches, layers_to_add, use_auto, manual_t
     period = _expansion_repeat_pattern(ca, common)['period']
     if minimum <= period:
         raise StructureEditError('Terminal completion needs an observed same-phase repeat in every protofilament.')
-    # Ask the established expander for both terminal candidates. Its source is
-    # still the whole assembly: the longer stacks' extra atoms are never cut.
+    # Generate both terminal candidates from the complete assembly, preserving
+    # all atoms in longer stacks.
     probe = _edit_clone(editor)
     repair_result = expand_structure_layers(probe, common, 2 * (depth - minimum), True, 0., 4.8,
         water_z_limit, label_generator=label_generator, repeat_units=period)
     geometry = probe.report['geometry']
     rotation, translation = np.array(geometry['cycle_matrix']), np.array(geometry['cycle_vector'])
     axis = np.array(geometry['axis'])
-    # Validate every observed pair, including the fifth chains omitted from
-    # the common-length fitting view. A pooled core may not hide a bad stack.
+    # Validate all observed pairs, including chains outside the common-length
+    # fit; pooled core agreement does not replace per-stack validation.
     errors = []
     for stack in sandwiches:
         for i in range(len(stack) - period):
@@ -2728,7 +2726,7 @@ def _expand_unequal_stacks(editor, sandwiches, layers_to_add, use_auto, manual_t
             any(t['orientation'] != expected_orientation.get(frozenset(t['chains']))
                 for t in checked['protofilaments'])):
         raise StructureEditError('Modeled terminal copies did not produce the expected complete stacks; no edit applied.')
-    # Reject overlap with another scaffold, not just errors in our own track.
+    # Check for overlaps with every scaffold, including neighboring tracks.
     repaired_ca = staged.ca_chains()
     if not _expansion_repeat_pattern(repaired_ca, completed)['compatible'](period):
         raise StructureEditError('Terminal completion changed the source orientation motif; no edit applied.')
@@ -2856,8 +2854,8 @@ def _check_new_ca_overlaps(editor, *, reject=False):
                    f'across placed copies ({clash_count} pairs). Review repeat geometry and source contacts.')
         if reject:
             raise StructureEditError(message + ' Manual expansion was not applied.')
-        # Flexible experimental templates may have poor terminal contacts. Report
-        # these explicitly without removing the existing automatic-edit workflow.
+        # Report poor terminal contacts without excluding flexible experimental
+        # templates from automatic expansion.
         editor.report['warnings'].append(message)
 
 
@@ -2916,10 +2914,9 @@ def _fit_repeat_transform(ca, stacks, period, axis, centers, *, computed_axis, r
         rigid_cycle_max_error = float(np.linalg.norm(full_p @ rotation.T + free_translation - full_q, axis=1).max())
         cycle_angle = math.degrees(math.acos(float(np.clip((np.trace(rotation)-1)/2, -1, 1))))
         if (step > 1 or randomize) and rigid_cycle_max_error > RIGID_REPEAT_COORDINATE_TOLERANCE:
-            # Flexible multi-phase templates retain the established directional
-            # model. An exact rigid cycle does not need that extra assumption:
-            # require EVERY matched CA, not just a trimmed core, to agree within
-            # coordinate-rounding tolerance before using its unconstrained axis.
+    # An unconstrained axis requires all matched C-alpha atoms to agree within
+    # coordinate-rounding tolerance. Flexible multi-phase templates retain
+    # the directional model.
             if repeat_directions:
                 axis = np.mean(repeat_directions, axis=0)
                 norm = np.linalg.norm(axis)
@@ -3804,7 +3801,7 @@ try:
     from PyQt6.QtWidgets import (QApplication, QWidget, QLabel, QLineEdit,
                                  QPushButton, QTextEdit, QMessageBox, QFileDialog,
                                  QVBoxLayout, QHBoxLayout, QSizePolicy, QSlider,
-                                 QSplitter, QSpinBox, QGroupBox, QFormLayout,
+                                 QSplitter, QSpinBox, QDoubleSpinBox, QGroupBox, QFormLayout,
                                  QCheckBox, QTableWidget, QHeaderView, QTableWidgetItem,
                                  QTextBrowser, QDialog, QComboBox, QTabWidget, QButtonGroup, QFrame,
                                  QScrollArea, QLayout)
@@ -3844,8 +3841,7 @@ def open_chain_modifier():
         return structure_chain_id(index)
 
     def selection_mode_icon(mode):
-        # Photoshop-style square set operations, painted at double resolution
-        # so the small toolbar glyphs stay crisp on high-DPI displays.
+        # Render selection set-operation icons at double resolution for high-DPI displays.
         first, second = QPainterPath(), QPainterPath()
         first.addRect(QRectF(4, 4, 10, 10) if mode != 'new' else QRectF(5, 5, 14, 14))
         second.addRect(QRectF(10, 10, 10, 10))
@@ -4461,6 +4457,12 @@ def open_chain_modifier():
             layout = QVBoxLayout(left_widget)
             layout.setSpacing(2)
             layout.setContentsMargins(4, 4, 4, 4)
+            layout.setSizeConstraint(QLayout.SizeConstraint.SetMinimumSize)
+            self.control_panel = left_widget
+            self.control_scroll = QScrollArea()
+            self.control_scroll.setFrameShape(QFrame.Shape.NoFrame)
+            self.control_scroll.setWidgetResizable(True)
+            self.control_scroll.setWidget(left_widget)
 
             hb_load = QHBoxLayout()
             self.cmb_models = QComboBox()
@@ -4615,6 +4617,7 @@ def open_chain_modifier():
             v_ops.addLayout(hb_res)
 
             self.grp_ops.setLayout(v_ops)
+            self.grp_ops.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Minimum)
             layout.addWidget(self.grp_ops)
 
             self.grp_params = QGroupBox("Detection Parameters")
@@ -4648,6 +4651,7 @@ def open_chain_modifier():
             self.update_water_axial_limit()
 
             self.grp_params.setLayout(params_layout)
+            self.grp_params.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Minimum)
 
             self.text_area = QTextEdit()
             self.text_area.setReadOnly(True)
@@ -4681,7 +4685,7 @@ def open_chain_modifier():
             r_layout.addLayout(viewer_layout)
 
             splitter = QSplitter(Qt.Orientation.Horizontal)
-            splitter.addWidget(left_widget)
+            splitter.addWidget(self.control_scroll)
             splitter.addWidget(right_widget)
 
             splitter.setStretchFactor(0, 4)
@@ -5649,8 +5653,7 @@ def open_chain_modifier():
                 except Exception as e:
                     QMessageBox.critical(self, "Error", f"Failed to export raw file:\n{e}")
 
-    # Screen-RGB palettes inspired by contemporary peach, mocha, lavender and
-    # aqua trends; these are original combinations, not certified Pantone matches.
+    # Independent RGB palettes; the references below document their colour inspiration.
     # Inspiration: https://www.pantone.com/na/en-us/color-of-the-year/2024
     # https://connect.pantone.com/color-insider/the-story-of-color-of-the-year-2025
     # https://www.pantone.com/articles/color-palettes/new-pantone-pms-colors-2026-color-palettes
@@ -5697,6 +5700,10 @@ def open_chain_modifier():
             scroll_control_panel(self, event)
 
     class PanelSpinBox(QSpinBox):
+        def wheelEvent(self, event):
+            scroll_control_panel(self, event)
+
+    class PanelDoubleSpinBox(QDoubleSpinBox):
         def wheelEvent(self, event):
             scroll_control_panel(self, event)
 
@@ -5861,6 +5868,20 @@ def open_chain_modifier():
                 self.hue = hue
             self._sync_controls()
 
+        def show_below(self, widget):
+            self.adjustSize()
+            position = widget.mapToGlobal(widget.rect().bottomLeft())
+            screen = QApplication.screenAt(position) or QApplication.primaryScreen()
+            bounds = screen.availableGeometry()
+            x = max(bounds.left(), min(position.x(), bounds.right() - self.width() + 1))
+            y = position.y() + 4
+            if y + self.height() > bounds.bottom():
+                y = widget.mapToGlobal(widget.rect().topLeft()).y() - self.height() - 4
+            self.move(x, max(bounds.top(), y))
+            self.show()
+            self.hex_edit.setFocus()
+            self.hex_edit.selectAll()
+
         def _sync_controls(self):
             self.wheel.hue, self.wheel.saturation = self.hue, self.saturation
             self.wheel.update()
@@ -5893,6 +5914,78 @@ def open_chain_modifier():
                 color = QColor('#' + text.lstrip('#'))
                 self.set_color(color)
                 self.colorChanged.emit(color.name())
+
+    class AnnotationColorControl(QWidget):
+        """Colour swatch and inline RGB fields, with a wheel/hex popup and optional Auto."""
+
+        def __init__(self, parent=None, *, allow_auto=True):
+            super().__init__(parent)
+            self._color = '#000000'
+            self._allow_auto = allow_auto
+            layout = QHBoxLayout(self)
+            layout.setContentsMargins(0, 0, 0, 0)
+            layout.setSpacing(5)
+            self.swatch = QPushButton()
+            self.swatch.setFixedSize(48, 24)
+            self.swatch.setToolTip('Choose a colour with the wheel or enter a hex code; applied with Run')
+            self.auto = QCheckBox('Auto')
+            self.auto.setChecked(allow_auto)
+            self.auto.setVisible(allow_auto)
+            self.auto.setToolTip('Choose black or white to contrast with the view background')
+            layout.addWidget(self.swatch)
+            self.rgb_inputs = []
+            for name in ('R', 'G', 'B'):
+                layout.addWidget(QLabel(name))
+                spin = PanelSpinBox()
+                spin.setRange(0, 255)
+                spin.setFixedWidth(52)
+                spin.setButtonSymbols(QSpinBox.ButtonSymbols.NoButtons)
+                spin.setToolTip(name + ' channel (0–255); editing selects a custom colour, applied with Run')
+                spin.valueChanged.connect(self._rgb_changed)
+                self.rgb_inputs.append(spin)
+                layout.addWidget(spin)
+            layout.addStretch()
+            layout.addWidget(self.auto)
+            self.picker = RampColorPicker(self)
+            self.picker.colorChanged.connect(self.set_color)
+            self.swatch.clicked.connect(self._show_picker)
+            self.auto.toggled.connect(self._sync)
+            self._sync()
+
+        def command_color(self):
+            return 'auto' if self._allow_auto and self.auto.isChecked() else self._color
+
+        def set_color(self, color):
+            value = QColor(color)
+            if not value.isValid():
+                raise ValueError('Choose a valid annotation colour.')
+            self._color = value.name()
+            self.auto.setChecked(False)
+            self._sync()
+
+        def _sync(self):
+            automatic = self._allow_auto and self.auto.isChecked()
+            background = ('qlineargradient(x1:0,y1:0,x2:1,y2:0,stop:0 #222222,'
+                          'stop:0.49 #222222,stop:0.5 #eeeeee,stop:1 #eeeeee)'
+                          if automatic else self._color)
+            self.swatch.setStyleSheet(f'background: {background}; border: 1px solid #777; '
+                                     'padding: 0px; border-radius: 3px;')
+            for spin, value in zip(self.rgb_inputs, QColor(self._color).getRgb()[:3]):
+                spin.blockSignals(True)
+                spin.setValue(value)
+                spin.blockSignals(False)
+
+        def _rgb_changed(self, value):
+            self.set_color(QColor(*(spin.value() for spin in self.rgb_inputs)))
+            self.picker.set_color(self._color)
+
+        def _show_picker(self):
+            self.picker.set_color(self._color)
+            self.picker.show_below(self.swatch)
+
+        def hideEvent(self, event):
+            self.picker.hide()
+            super().hideEvent(event)
 
     class LocalResColorEditor(QWidget):
         colorsChanged = pyqtSignal()
@@ -5982,8 +6075,8 @@ def open_chain_modifier():
         def eventFilter(self, watched, event):
             if (event.type() == QEvent.Type.MouseButtonPress and self.isVisible()
                     and self.selected_index >= 0 and isinstance(watched, QWidget)):
-                # Editing controls keep the selection. Backgrounds, the preview,
-                # other tabs and other windows deselect it without eating the click.
+            # Preserve selection within the editor. External clicks clear it
+            # without consuming the event.
                 keep = (self.ramp, self.rgb_row, self.picker, self.btn_add,
                         self.btn_remove, self.btn_reverse)
                 if not any((watched is widget or widget.isAncestorOf(watched))
@@ -6099,18 +6192,7 @@ def open_chain_modifier():
             if self.selected_index < 0:
                 return
             self.picker.set_color(self.colors[self.selected_index])
-            self.picker.adjustSize()
-            position = self.swatch.mapToGlobal(self.swatch.rect().bottomLeft())
-            screen = QApplication.screenAt(position) or QApplication.primaryScreen()
-            bounds = screen.availableGeometry()
-            x = max(bounds.left(), min(position.x(), bounds.right() - self.picker.width() + 1))
-            y = position.y() + 4
-            if y + self.picker.height() > bounds.bottom():
-                y = self.swatch.mapToGlobal(self.swatch.rect().topLeft()).y() - self.picker.height() - 4
-            self.picker.move(x, max(bounds.top(), y))
-            self.picker.show()
-            self.picker.hex_edit.setFocus()
-            self.picker.hex_edit.selectAll()
+            self.picker.show_below(self.swatch)
 
         def hideEvent(self, event):
             self.select_stop(-1)
@@ -6124,6 +6206,12 @@ def open_chain_modifier():
 
     class LocalResWidget(QWidget):
         MAX_DECIMAL_PLACES = 6
+        ANNOTATION_DEFAULTS = {
+            'scalebar_thickness': 10, 'scalebar_font_size': 20,
+            'scalebar_bold': False, 'scalebar_color': 'auto',
+            'key_font_size': 14, 'key_bold': False, 'key_border_width': 4,
+            'key_width': 15, 'key_height': 3, 'key_color': 'auto',
+        }
 
         def __init__(self, tool_instance, session, parent=None):
             super().__init__(parent)
@@ -6143,6 +6231,20 @@ def open_chain_modifier():
             self.auto_refresh_timer.start(1000)
 
         def initUI(self):
+            def section_heading(text):
+                row = QWidget()
+                layout = QHBoxLayout(row)
+                layout.setContentsMargins(0, 6, 0, 2)
+                label = QLabel(text)
+                label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+                label.setStyleSheet('font-weight: bold; color: #98c379;')
+                for widget, stretch in ((QFrame(), 1), (label, 0), (QFrame(), 1)):
+                    if isinstance(widget, QFrame) and not isinstance(widget, QLabel):
+                        widget.setFixedHeight(1)
+                        widget.setStyleSheet('background: #555; border: none;')
+                    layout.addWidget(widget, stretch)
+                return row
+
             main_layout = QHBoxLayout(self)
             splitter = QSplitter(Qt.Orientation.Horizontal)
             self.splitter = splitter
@@ -6150,8 +6252,7 @@ def open_chain_modifier():
             left_widget = QWidget()
             left_layout = QVBoxLayout(left_widget)
             self.control_panel = left_widget
-            # Recompute the content minimum when Customize expands/collapses.
-            # The scroll area takes the excess height instead of crushing fields.
+            # Update the scrollable minimum size when customization panels change.
             left_layout.setSizeConstraint(QLayout.SizeConstraint.SetMinimumSize)
             self.control_scroll = QScrollArea()
             self.control_scroll.setFrameShape(QFrame.Shape.NoFrame)
@@ -6201,14 +6302,26 @@ def open_chain_modifier():
             form_params.addRow('Decimal Place', decimal_row)
 
             self.chk_customize = QCheckBox('Customize')
-            self.chk_customize.setToolTip('Use an editable colour ramp in the preview and when running')
+            self.chk_customize.setToolTip('Customize the colour ramp and silhouette width')
             form_params.addRow(self.chk_customize)
+            self.customize_panel = QWidget()
+            customize_layout = QVBoxLayout(self.customize_panel)
+            customize_layout.setContentsMargins(0, 0, 0, 0)
             self.color_editor = LocalResColorEditor(self)
-            form_params.addRow(self.color_editor)
-            self.color_editor.hide()
+            customize_layout.addWidget(self.color_editor)
+            customize_layout.addWidget(section_heading('Silhouette'))
+            silhouette_layout = QFormLayout()
+            self.entry_silhouette_width = QLineEdit('20')
+            self.entry_silhouette_width.setToolTip(
+                'Silhouette width in pixels: 0 disables outlines; otherwise at least 1. Applied with Run.')
+            silhouette_layout.addRow('Silhouette width:', self.entry_silhouette_width)
+            self.silhouette_color = AnnotationColorControl(allow_auto=False)
+            silhouette_layout.addRow(self.silhouette_color)
+            customize_layout.addLayout(silhouette_layout)
+            form_params.addRow(self.customize_panel)
+            self.customize_panel.hide()
             
             grp_params.setLayout(form_params)
-            left_layout.addWidget(grp_params)
             
             grp_preview = QGroupBox("Preview Control")
             v_preview = QVBoxLayout()
@@ -6237,14 +6350,73 @@ def open_chain_modifier():
             rms_layout.addWidget(self.slider_rms)
             v_preview.addLayout(rms_layout)
 
+            grp_preview.setLayout(v_preview)
+            left_layout.addWidget(grp_preview)
+            left_layout.addWidget(grp_params)
+
+            grp_annotations = QGroupBox('Annotation Control')
+            annotations_layout = QVBoxLayout(grp_annotations)
             scalebar_layout = QFormLayout()
             self.entry_scalebar = QLineEdit('10')
             self.entry_scalebar.setToolTip('Positive scale bar length in Å, applied with Run')
             scalebar_layout.addRow('Scale bar (Å):', self.entry_scalebar)
-            v_preview.addLayout(scalebar_layout)
-            
-            grp_preview.setLayout(v_preview)
-            left_layout.addWidget(grp_preview)
+            annotations_layout.addLayout(scalebar_layout)
+            self.chk_annotation_style = QCheckBox('Customize')
+            self.chk_annotation_style.setToolTip(
+                'Use custom annotation styles when checked, or defaults when unchecked; applied with Run')
+            annotations_layout.addWidget(self.chk_annotation_style)
+            self.annotation_style_panel = QWidget()
+            style_layout = QFormLayout(self.annotation_style_panel)
+            style_layout.setContentsMargins(0, 0, 0, 0)
+
+            def number_control(value, minimum, maximum, decimals=0):
+                spin = PanelDoubleSpinBox() if decimals else PanelSpinBox()
+                if decimals:
+                    spin.setDecimals(decimals)
+                    spin.setSingleStep(0.5)
+                spin.setRange(minimum, maximum)
+                spin.setValue(value)
+                return spin
+
+            def font_row(size):
+                row = QWidget()
+                layout = QHBoxLayout(row)
+                layout.setContentsMargins(0, 0, 0, 0)
+                spin = number_control(size, 1, 200)
+                bold = QCheckBox('Bold')
+                layout.addWidget(spin, 1)
+                layout.addWidget(bold)
+                return row, spin, bold
+
+            defaults = self.ANNOTATION_DEFAULTS
+            style_layout.addRow(section_heading('Scalebar'))
+            self.spin_scalebar_thickness = number_control(defaults['scalebar_thickness'], 0.5, 100, decimals=1)
+            self.spin_scalebar_thickness.setToolTip('Scale bar stroke width in pixels')
+            style_layout.addRow('Stroke width:', self.spin_scalebar_thickness)
+            row, self.spin_scalebar_font_size, self.chk_scalebar_bold = font_row(defaults['scalebar_font_size'])
+            style_layout.addRow('Font size:', row)
+            self.scalebar_color = AnnotationColorControl()
+            style_layout.addRow(self.scalebar_color)
+
+            style_layout.addRow(section_heading('Color key'))
+            row, self.spin_key_font_size, self.chk_key_bold = font_row(defaults['key_font_size'])
+            style_layout.addRow('Font size:', row)
+            self.spin_key_border_width = number_control(defaults['key_border_width'], 0, 30, decimals=1)
+            self.spin_key_border_width.setToolTip('Outline thickness in pixels; 0 hides the border')
+            style_layout.addRow('Border width:', self.spin_key_border_width)
+            self.spin_key_width = number_control(defaults['key_width'], 0.5, 95, decimals=1)
+            self.spin_key_height = number_control(defaults['key_height'], 0.5, 90, decimals=1)
+            self.spin_key_width.setToolTip('Colour bar width as a percentage of the ChimeraX view')
+            self.spin_key_height.setToolTip('Colour bar height as a percentage of the ChimeraX view')
+            style_layout.addRow('Width:', self.spin_key_width)
+            style_layout.addRow('Height:', self.spin_key_height)
+            self.key_color = AnnotationColorControl()
+            style_layout.addRow(self.key_color)
+            annotations_layout.addWidget(self.annotation_style_panel)
+            self.annotation_style_panel.hide()
+            self.chk_annotation_style.toggled.connect(self.annotation_style_panel.setVisible)
+            self.chk_annotation_style.setChecked(False)
+            left_layout.addWidget(grp_annotations)
             
             left_layout.addStretch()
             
@@ -6252,7 +6424,7 @@ def open_chain_modifier():
             self.btn_run.setStyleSheet("font-weight: bold; padding: 10px;")
             self.btn_run.clicked.connect(self.execute_commands)
             left_layout.addWidget(self.btn_run)
-            for group in (grp_models, grp_params, grp_preview):
+            for group in (grp_models, grp_params, grp_preview, grp_annotations):
                 group.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Minimum)
             
             right_widget = QWidget()
@@ -6299,8 +6471,27 @@ def open_chain_modifier():
                 self._color_preview_timer.start()
 
         def _toggle_customize(self, checked):
-            self.color_editor.setVisible(checked)
+            self.customize_panel.setVisible(checked)
             self.draw_plot()
+
+        def _silhouette_width(self):
+            if not self.chk_customize.isChecked():
+                return 20.0
+            message = 'Silhouette width must be 0 (off) or a finite number of at least 1 pixel.'
+            try:
+                width = float(self.entry_silhouette_width.text().strip())
+            except ValueError:
+                raise ValueError(message) from None
+            if not np.isfinite(width) or width < 0 or 0 < width < 1:
+                raise ValueError(message)
+            return width
+
+        def _silhouette_command(self):
+            width = self._silhouette_width()
+            color = self.silhouette_color.command_color() if self.chk_customize.isChecked() else '#000000'
+            if width == 0:
+                return f'graphics silhouettes false color {color}'
+            return f'graphics silhouettes true width {width:g} color {color}'
 
         def _change_decimal_places(self, increment):
             self.decimal_places = max(0, min(self.MAX_DECIMAL_PLACES, self.decimal_places + increment))
@@ -6331,6 +6522,34 @@ def open_chain_modifier():
                            for i, color in enumerate(colors))
             return f'color sample #{map_id} map #{locres_id} palette {palette}', 'key ' + key
 
+        def _annotation_style(self):
+            # Use defaults while customization is disabled; retain custom values.
+            if not self.chk_annotation_style.isChecked():
+                return self.ANNOTATION_DEFAULTS.copy()
+            return {
+                'scalebar_thickness': self.spin_scalebar_thickness.value(),
+                'scalebar_font_size': self.spin_scalebar_font_size.value(),
+                'scalebar_bold': self.chk_scalebar_bold.isChecked(),
+                'scalebar_color': self.scalebar_color.command_color(),
+                'key_font_size': self.spin_key_font_size.value(),
+                'key_bold': self.chk_key_bold.isChecked(),
+                'key_border_width': self.spin_key_border_width.value(),
+                'key_width': self.spin_key_width.value(),
+                'key_height': self.spin_key_height.value(),
+                'key_color': self.key_color.command_color(),
+            }
+
+        def _key_style_command(self):
+            style = self._annotation_style()
+            border_width = style['key_border_width']
+            color = style['key_color']
+            return (f'key fontSize {style["key_font_size"]} '
+                    f'bold {str(style["key_bold"]).lower()} '
+                    f'border {str(border_width > 0).lower()} borderWidth {border_width:g} '
+                    f'size {style["key_width"] / 100:g},{style["key_height"] / 100:g} '
+                    f'labelColor {color} borderColor {color} '
+                    f'pos {max(0, 0.95 - style["key_width"] / 100):g},0.06')
+
         def _scalebar_commands(self):
             try:
                 length = float(self.entry_scalebar.text().strip())
@@ -6342,13 +6561,25 @@ def open_chain_modifier():
             from chimerax.label.label2d import session_labels
             labels = session_labels(self.session, create=False)
             action = 'change' if labels is not None and labels.named_label('scalebar_legend') is not None else 'create'
-            return (f'scalebar {value} xpos 0.01 ypos 0.01',
-                    f'2dlabels {action} scalebar_legend text "{value} Å" xpos 0.01 ypos 0.02 size 20')
+            style = self._annotation_style()
+            thickness = style['scalebar_thickness']
+            color = style['scalebar_color']
+            # Keep the label above a thicker bar, including on high-DPI screens.
+            height = max(1, self.session.main_view.window_size[1])
+            label_y = 0.01 + (thickness + 4) * self.devicePixelRatioF() / height
+            return (f'scalebar {value} thickness {thickness:g} color {color} xpos 0.01 ypos 0.01',
+                    f'2dlabels {action} scalebar_legend text "{value} Å" '
+                    f'size {style["scalebar_font_size"]} '
+                    f'bold {str(style["scalebar_bold"]).lower()} color {color} '
+                    f'xpos 0.01 ypos {label_y:g}')
 
         def dispose(self):
             self.auto_refresh_timer.stop()
             self._color_preview_timer.stop()
             self.color_editor.dispose()
+            self.silhouette_color.picker.close()
+            self.scalebar_color.picker.close()
+            self.key_color.picker.close()
             self.data_map = self.data_locres = None
             self._preview_slices = None
             self._preview_mask = None
@@ -6628,20 +6859,21 @@ def open_chain_modifier():
             except ValueError as error:
                 QMessageBox.critical(self, "Invalid Scale Bar", str(error))
                 return
+            try:
+                silhouette_command = self._silhouette_command()
+            except ValueError as error:
+                QMessageBox.critical(self, 'Invalid Silhouette Width', str(error))
+                return
 
             commands = f"""
 {color_command}
 surface dust #{map_id}
 set bgColor #ffffff00
 hide #{locres_id} models 
-graphics silhouettes true
-graphics silhouette width 20
+{silhouette_command}
 ui tool show "Surface Color"
 {key_command}
-key fontSize 14
-key pos 0.8000,0.06000
-key size 0.15000,0.03000
-key borderWidth 3.0
+{self._key_style_command()}
 surface zone #{map_id} near #{pdb_id}
 hide #{pdb_id} models 
 hide #{locres_id} models
@@ -6672,14 +6904,6 @@ lighting soft
             self.addTab(self.cif_widget, "Layer Viewer")
             self.addTab(self.localres_widget, "LocalRes")
             
-            max_min_height = max(
-                self.pdb_widget.minimumSizeHint().height(),
-                self.cif_widget.minimumSizeHint().height(),
-                self.localres_widget.minimumSizeHint().height()
-            )
-            self.setMinimumHeight(max_min_height)
-            
-
     return ModifierToolTabs
 
 
