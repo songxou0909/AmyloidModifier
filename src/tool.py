@@ -21,7 +21,7 @@ from typing import NamedTuple
 from collections import Counter, defaultdict
 
 
-VERSION = '2.2.1'
+VERSION = '2.2.2'
 # Below this per-cycle angle, a free rotation axis is dominated by coordinate
 # rounding/noise. Use the measured repeat direction to constrain the rotation.
 MIN_RESOLVED_ROTATION_DEGREES = 0.05
@@ -754,43 +754,58 @@ class StructureEditor:
                 phase = phases[site['identity'], period].most_common(1)[0][0]
                 for residue in site['residues']:
                     layer = phase + period * round((residue['layer'] - phase) / period)
-                    residue['layer'] = min(len(sandwiches[0]) - 1, max(0, layer))
+                    residue['layer'] = min(len(sandwiches[site['pf']]) - 1, max(0, layer))
         return sites
 
-    def associated_residues_for_layers(self, sandwiches, keep_indices, axis, axial_limit=4.0):
+    def associated_residues_for_layers(self, sandwiches, keep_indices, axis, axial_limit=4.0,
+                                       *, keep_chains=None):
         # Keep complete ligand repeats when trimming protein layers.
         _, np = _structure_dependencies()
-        kept = set(keep_indices)
+        if keep_chains is None:
+            indices = set(keep_indices)
+            kept_by_pf = [{i for i in indices if 0 <= i < len(s)} for s in sandwiches]
+        else:
+            keep_chains = set(keep_chains)
+            kept_by_pf = [{i for i, c in enumerate(s) if c in keep_chains} for s in sandwiches]
         core = {c for s in sandwiches for c in s}
-        kept_chains = {s[i] for s in sandwiches for i in kept if 0 <= i < len(s)}
+        kept_chains = {s[i] for s, kept in zip(sandwiches, kept_by_pf) for i in kept}
         owners = self.associated_residues(core, axial_limit, axis)
         attached = self.covalent_residue_owners()
         owners.update(attached)
         result = {r for r, c in owners.items() if c in kept_chains}
-        if not kept or axis is None or len(sandwiches[0]) < 2:
+        if not kept_chains or axis is None or not any(len(s) >= 2 for s in sandwiches):
             return result
         ca = self.ca_chains()
         axis = np.asarray(axis, dtype=float)
         axis /= np.linalg.norm(axis)
-        centers = [np.mean([r['coord'] for s in sandwiches for r in ca[s[i]]], axis=0)
-                   for i in range(len(sandwiches[0]))]
-        rise = float(np.median(np.abs(np.diff(np.array(centers) @ axis))))
+        # Measure within each stack: unequal ends must not mix unrelated indices
+        # or shift a layer centroid when a shorter protofilament runs out.
+        spacings = []
+        for stack in sandwiches:
+            centers = np.array([np.mean([r['coord'] for r in ca[c]], axis=0) for c in stack])
+            spacings.extend(np.abs(np.diff(centers @ axis)))
+        rise = float(np.median(spacings))
         if rise < 1e-8:
             return result
         sites = self.associated_residue_repeats(sandwiches, axis, rise, axial_limit)
-        midpoint = float(np.mean(sorted(kept)))
         for site in sites:
+            kept = kept_by_pf[site['pf']]
+            depth = len(sandwiches[site['pf']])
+            if not kept:
+                result.difference_update(k for r in site['residues'] for k in r['keys'])
+                continue
+            midpoint = float(np.mean(sorted(kept)))
             if site.get('terminal_track') and kept == set(range(min(kept), max(kept) + 1)):
                 members = sorted(site['residues'], key=lambda r: r['layer'])
                 result.difference_update(k for r in members for k in r['keys'])
-                end = max(0, len(members) - (len(sandwiches[0]) - 1 - max(kept)))
+                end = max(0, len(members) - (depth - 1 - max(kept)))
                 result.update(k for r in members[min(kept):end] for k in r['keys'])
                 continue
             if site['period'] == 1:
                 continue
             members = site['residues']
             result.difference_update(k for r in members for k in r['keys'])
-            removed_repeats = len(sandwiches[0]) // site['period'] - len(kept) // site['period']
+            removed_repeats = depth // site['period'] - len(kept) // site['period']
             count = max(1, len(members) - removed_repeats)
             eligible = [r for r in members if min(abs(r['layer'] - i) for i in kept) <= site['period'] / 2]
             eligible.sort(key=lambda r: (abs(r['layer'] - midpoint), r['layer']))
@@ -4786,12 +4801,13 @@ def open_chain_modifier():
             try: return float(widget.text())
             except ValueError: return default
 
-        def get_kept_heteroatoms(self, keep_layer_indices, water_z_limit):
+        def get_kept_heteroatoms(self, keep_layer_indices, water_z_limit, *, keep_chains=None):
             if not self.working_structure or not self.final_sandwiches:
                 return set()
             editor = StructureEditor(self.working_structure)
             axis = (getattr(self, 'detection_result', None) or {}).get('axis')
-            return editor.associated_residues_for_layers(self.final_sandwiches, keep_layer_indices, axis, water_z_limit)
+            return editor.associated_residues_for_layers(self.final_sandwiches, keep_layer_indices, axis,
+                                                        water_z_limit, keep_chains=keep_chains)
 
 
         def check_live_edits(self):
@@ -4871,11 +4887,13 @@ def open_chain_modifier():
             if not self.working_structure or not self.final_sandwiches: return
             if self.cmb_protofilaments.count() == 0: return
 
+            target = self.cmb_protofilaments.currentData()
+            if target is None: return
             if not self.sync_viewer_to_structure():
                 return
+            self.process_pdb(self.working_structure)
+            if not self.final_sandwiches: return
             try:
-                target = self.cmb_protofilaments.currentData()
-                if target is None: return
                 if target['kind'] == 'ligand':
                     editor = StructureEditor(self.working_structure)
                     trim_ligand_target(editor, target)
@@ -4885,8 +4903,12 @@ def open_chain_modifier():
                         self.text_area.append('\n>>>> Trimmed ' + target['label'])
                         self.process_pdb(self.working_structure)
                     return
-                pf_index = target['pf']
-                if pf_index is None or pf_index < 0 or pf_index >= len(self.final_sandwiches): return
+                # Live deletions can reorder stacks by length. Resolve the selected
+                # protofilament by its surviving chains rather than its old index.
+                target_chains = {key[0] for key in target['residues']}
+                pf_index = next((i for i, stack in enumerate(self.final_sandwiches)
+                                 if target_chains.intersection(stack)), None)
+                if pf_index is None: return
 
                 total_layers = self.detected_units
                 keep_chains = set()
@@ -5173,9 +5195,12 @@ def open_chain_modifier():
                     return
             if not self.sync_viewer_to_structure():
                 return
+            # Refresh now as well as on the timer, so an immediate trim after a
+            # native chain deletion uses the current stack lengths and chain IDs.
+            self.process_pdb(self.working_structure)
+            if not self.final_sandwiches: return
             if expansion_context is not None:
                 # Refresh live coordinates after scene movement and reject changed topology.
-                self.process_pdb(self.working_structure)
                 if self._expansion_context() != expansion_context:
                     QMessageBox.warning(self, "Source changed", "The chain units changed while the expansion window was open. Review the current assignment and reopen expansion.")
                     return
@@ -5198,7 +5223,11 @@ def open_chain_modifier():
             if target_layers == total_layers and not needs_completion:
                 self.text_area.append(f"\nYour model is already having {total_layers} layer(s)")
                 return
-            if needs_completion and not (can_complete and target_layers >= total_layers):
+            if target_layers < total_layers and (self.layers_per_unit is None or
+                    any(not track['complete'] for track in self.detection_result['protofilaments'])):
+                QMessageBox.warning(self, "Incomplete stacks", "Layer trimming requires contiguous protofilaments with the same number of layers per chain. Unequal protofilament lengths are supported; internal gaps and inconsistent layer multiplicity must be resolved first.")
+                return
+            if target_layers >= total_layers and needs_completion and not can_complete:
                 QMessageBox.warning(self, "Incomplete stacks", "Automatic terminal completion requires contiguous stacks with a supported orientation motif and one layer per chain. Parallel stacks need at least two chains and may lack up to two terminal chains; other supported motifs need at least three chains and may lack one. Choose a target at least as large as the longest stack. Internal gaps and ambiguous stacks cannot be completed automatically.")
                 return
             if target_layers % unit_layers:
@@ -5210,18 +5239,17 @@ def open_chain_modifier():
                 edited = StructureBuffer(self.working_structure.name)
 
                 if target_layers < total_layers:
-                    start_idx = (total_units - target_units) // 2
-                    end_idx = start_idx + target_units
-                    valid_layer_indices = range(start_idx, end_idx)
-
                     keep_chains = set()
                     for sandwich in self.final_sandwiches:
-                        for i, chain_id in enumerate(sandwich):
-                            if i in valid_layer_indices: keep_chains.add(chain_id)
+                        # The target is a per-protofilament cap. Preserve shorter
+                        # stacks and center the retained span within each longer one.
+                        count = min(len(sandwich), target_units)
+                        start_idx = (len(sandwich) - count) // 2
+                        keep_chains.update(sandwich[start_idx:start_idx + count])
 
                     self.text_area.append("Calculating water/ion retention based on layer centroids...")
                     water_z_limit = self.get_param(self.edit_water_z, 4.0)
-                    keep_het_lines = self.get_kept_heteroatoms(valid_layer_indices, water_z_limit)
+                    keep_het_lines = self.get_kept_heteroatoms(None, water_z_limit, keep_chains=keep_chains)
 
                     if self.working_structure.format == 'cif':
                         self.write_trimmed_cif(self.working_structure, edited, keep_chains, keep_het_lines)
@@ -5272,8 +5300,9 @@ def open_chain_modifier():
                 if not self.commit_working_structure(edited):
                     self.text_area.append("\nThe in-memory edit could not be opened; the previous ChimeraX model was kept.")
                     return
-                self.operation_log(('Expansion' if target_layers >= total_layers else 'Trimming') +
-                                   f' complete: {target_layers} layers per protofilament.')
+                self.operation_log((f'Expansion complete: {target_layers} layers per protofilament.'
+                                    if target_layers >= total_layers else
+                                    f'Trimming complete: at most {target_layers} layers per protofilament.'))
 
                 if (target_layers >= total_layers and expansion_options.get('run_dssp', True)
                         and getattr(self, 'working_model_id', None)):
