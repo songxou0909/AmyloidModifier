@@ -1,0 +1,536 @@
+[
+  {
+    "download_url": "https://cxtoolshed.rbvi.ucsf.edu/download/chimeraxamyloidmodifier/1.0/1374",
+    "notes": "",
+    "released": "2026-03-10T11:38:52",
+    "version": "1.0",
+    "filename": "chimerax_amyloidmodifier-1.0-py3-none-any.whl",
+    "bytes": 21916,
+    "sha256": "6e5a35d22b422ab061cc3808fe985b0834b128e0d770f0a6f6a7c3e9e769ed2e",
+    "md5": "7bef9e0e079a91d67afd1babaef56019",
+    "python_files": [
+      "chimerax/pdb_modifier/__init__.py",
+      "chimerax/pdb_modifier/tool.py"
+    ],
+    "compiled_files": [],
+    "license_files": [],
+    "requires_dist": [
+      "ChimeraX-Core~=1.0"
+    ]
+  },
+  {
+    "download_url": "https://cxtoolshed.rbvi.ucsf.edu/download/chimeraxamyloidmodifier/1.1/1376",
+    "notes": "Fixed a bug where loading error occurs when the user name has a space",
+    "released": "2026-03-10T20:38:25",
+    "version": "1.1",
+    "filename": "chimerax_amyloidmodifier-1.1-py3-none-any.whl",
+    "bytes": 21334,
+    "sha256": "bc3bfd285aa7bd7a0655fe5d864b4bb228e4f794a3ac79400009a868b29caf59",
+    "md5": "d57b015528d0e2145992e3a31344cf3a",
+    "python_files": [
+      "chimerax/amyloid_modifier/__init__.py",
+      "chimerax/amyloid_modifier/tool.py"
+    ],
+    "compiled_files": [],
+    "license_files": [],
+    "requires_dist": [
+      "ChimeraX-Core~=1.0"
+    ]
+  },
+  {
+    "download_url": "https://cxtoolshed.rbvi.ucsf.edu/download/chimeraxamyloidmodifier/1.2/1378",
+    "notes": "Added a function to not only trim but also expand the current model",
+    "released": "2026-03-11T03:08:02",
+    "version": "1.2",
+    "filename": "chimerax_amyloidmodifier-1.2-py3-none-any.whl",
+    "bytes": 25264,
+    "sha256": "80af4129a27f9341ffb651f2b46c17c1d0cade9507d9c8051b8d639312c56de2",
+    "md5": "0946a1caebf76c76775ad58ee6166e58",
+    "python_files": [
+      "chimerax/amyloidmodifier/__init__.py",
+      "chimerax/amyloidmodifier/tool.py"
+    ],
+    "compiled_files": [],
+    "license_files": [],
+    "requires_dist": [
+      "ChimeraX-Core~=1.0"
+    ]
+  },
+  {
+    "download_url": "https://cxtoolshed.rbvi.ucsf.edu/download/chimeraxamyloidmodifier/1.3/1380",
+    "notes": "Added output log for model expansion, adjusted UI for a better layout",
+    "released": "2026-03-11T07:53:36",
+    "version": "1.3",
+    "filename": "ChimeraX_AmyloidModifier-1.3-py3-none-any.whl",
+    "bytes": 26589,
+    "sha256": "1ace0b843e246112b1330628da545212cefd1762be72b15d57a0e00ed9f7e1fd",
+    "md5": "6bf560c8dd70971ce7f85f7ccfff17a9",
+    "python_files": [
+      "chimerax/amyloidmodifier/__init__.py",
+      "chimerax/amyloidmodifier/tool.py"
+    ],
+    "compiled_files": [],
+    "license_files": [
+      "ChimeraX_AmyloidModifier-1.3.dist-info/LICENSE"
+    ],
+    "requires_dist": [
+      "ChimeraX-Core ~=1.0"
+    ]
+  },
+  {
+    "download_url": "https://cxtoolshed.rbvi.ucsf.edu/download/chimeraxamyloidmodifier/1.4/1381",
+    "notes": "Faster editing, fix renaming bugs",
+    "released": "2026-03-12T02:00:28",
+    "version": "1.4",
+    "filename": "chimerax_amyloidmodifier-1.4-py3-none-any.whl",
+    "bytes": 26151,
+    "sha256": "3c21148109cdc0258961cae3133c344b648a38d5a70aa0cdd01b5e478ef6879c",
+    "md5": "693d10842286b5992ebd18f427449bf5",
+    "python_files": [
+      "chimerax/amyloidmodifier/__init__.py",
+      "chimerax/amyloidmodifier/tool.py"
+    ],
+    "compiled_files": [],
+    "license_files": [],
+    "requires_dist": [
+      "ChimeraX-Core~=1.0"
+    ]
+  },
+  {
+    "download_url": "https://cxtoolshed.rbvi.ucsf.edu/download/chimeraxamyloidmodifier/1.5/1383",
+    "notes": "",
+    "released": "2026-03-13T11:09:16",
+    "version": "1.5",
+    "filename": "ChimeraX_AmyloidModifier-1.5-py3-none-any.whl",
+    "bytes": 33450,
+    "sha256": "64f7335414e227567be2352b979ebab4e912a6f10282b5b492dd09049c069da4",
+    "md5": "d62a96b9f81055b45e58d4945ae0aca4",
+    "python_files": [
+      "chimerax/amyloidmodifier/__init__.py",
+      "chimerax/amyloidmodifier/tool.py"
+    ],
+    "compiled_files": [],
+    "license_files": [
+      "ChimeraX_AmyloidModifier-1.5.dist-info/LICENSE"
+    ],
+    "requires_dist": [
+      "ChimeraX-Core ~=1.0"
+    ]
+  },
+  {
+    "download_url": "https://cxtoolshed.rbvi.ucsf.edu/download/chimeraxamyloidmodifier/1.6/1384",
+    "notes": "Fixed bugs in loading error for CIF files if an empty header is present, and renaming error for beta sheet structs for CIF files",
+    "released": "2026-03-15T08:48:51",
+    "version": "1.6",
+    "filename": "ChimeraX_AmyloidModifier-1.6-py3-none-any.whl",
+    "bytes": 34194,
+    "sha256": "e1081a0c88dc8ffdb5f8efa779249d0b7d8d6513767f3bc44f45aed49a560f45",
+    "md5": "7ef5a1df54dab9df47d85d0785d5777b",
+    "python_files": [
+      "chimerax/amyloidmodifier/__init__.py",
+      "chimerax/amyloidmodifier/tool.py"
+    ],
+    "compiled_files": [],
+    "license_files": [
+      "ChimeraX_AmyloidModifier-1.6.dist-info/LICENSE"
+    ],
+    "requires_dist": [
+      "ChimeraX-Core ~=1.0"
+    ]
+  },
+  {
+    "download_url": "https://cxtoolshed.rbvi.ucsf.edu/download/chimeraxamyloidmodifier/1.7/1385",
+    "notes": "Updated expand algorithm",
+    "released": "2026-03-15T10:03:12",
+    "version": "1.7",
+    "filename": "ChimeraX_AmyloidModifier-1.7-py3-none-any.whl",
+    "bytes": 34411,
+    "sha256": "1827626207e4cfd029babf8ef06fa20c64cc14a054fac58f3693eaf2d0534afb",
+    "md5": "32779d20842bc204bc0c72d003ab1f36",
+    "python_files": [
+      "chimerax/amyloidmodifier/__init__.py",
+      "chimerax/amyloidmodifier/tool.py"
+    ],
+    "compiled_files": [],
+    "license_files": [
+      "ChimeraX_AmyloidModifier-1.7.dist-info/LICENSE"
+    ],
+    "requires_dist": [
+      "ChimeraX-Core ~=1.0"
+    ]
+  },
+  {
+    "download_url": "https://cxtoolshed.rbvi.ucsf.edu/download/chimeraxamyloidmodifier/1.8/1386",
+    "notes": "Rename logic update for modifying cif files",
+    "released": "2026-03-15T20:26:16",
+    "version": "1.8",
+    "filename": "chimerax_amyloidmodifier-1.8-py3-none-any.whl",
+    "bytes": 34336,
+    "sha256": "682e999d6c021cf97f029349a9b72a5c0df6919fefaa0e238fab455d29b3be1d",
+    "md5": "199fa65ab2c4208934a7db71f669a192",
+    "python_files": [
+      "chimerax/amyloidmodifier/__init__.py",
+      "chimerax/amyloidmodifier/tool.py"
+    ],
+    "compiled_files": [],
+    "license_files": [],
+    "requires_dist": [
+      "ChimeraX-Core~=1.0"
+    ]
+  },
+  {
+    "download_url": "https://cxtoolshed.rbvi.ucsf.edu/download/chimeraxamyloidmodifier/1.9/1387",
+    "notes": "Added a feature to quickly make local resolution images",
+    "released": "2026-03-15T22:03:39",
+    "version": "1.9",
+    "filename": "chimerax_amyloidmodifier-1.9-py3-none-any.whl",
+    "bytes": 37315,
+    "sha256": "694f8dddadf8ce05175b1aa09e95ffae8695d6c30c5f30bd1d79c4307de7ebd2",
+    "md5": "da30eb1b3caac073c4caaf1702a0d17f",
+    "python_files": [
+      "chimerax/amyloidmodifier/__init__.py",
+      "chimerax/amyloidmodifier/tool.py"
+    ],
+    "compiled_files": [],
+    "license_files": [],
+    "requires_dist": [
+      "ChimeraX-Core~=1.0"
+    ]
+  },
+  {
+    "download_url": "https://cxtoolshed.rbvi.ucsf.edu/download/chimeraxamyloidmodifier/1.10/1388",
+    "notes": "Local Resolution Images:\n\nAuto-compute resolution for best image\n\nMap level is now adjustable",
+    "released": "2026-03-16T09:27:00",
+    "version": "1.10",
+    "filename": "ChimeraX_AmyloidModifier-1.10-py3-none-any.whl",
+    "bytes": 38821,
+    "sha256": "00b429beda17aa449109b4f7bc2e9e509ee8b0c6b6c69130f994c8f314ff6a8a",
+    "md5": "2aada075175aa293113ef36a04769602",
+    "python_files": [
+      "chimerax/amyloidmodifier/__init__.py",
+      "chimerax/amyloidmodifier/tool.py"
+    ],
+    "compiled_files": [],
+    "license_files": [
+      "ChimeraX_AmyloidModifier-1.10.dist-info/LICENSE"
+    ],
+    "requires_dist": [
+      "ChimeraX-Core ~=1.0"
+    ]
+  },
+  {
+    "download_url": "https://cxtoolshed.rbvi.ucsf.edu/download/chimeraxamyloidmodifier/1.11/1389",
+    "notes": "Modifier: added a feature to trim away protofilaments\nLocRes: improved map/locres map detection to auto load\nMinor UI fix on Mac",
+    "released": "2026-03-17T10:37:45",
+    "version": "1.11",
+    "filename": "ChimeraX_AmyloidModifier-1.11-py3-none-any.whl",
+    "bytes": 39468,
+    "sha256": "3c9c3951a5b2c7efec75751c33a71fdd829d055dd63c086203b8c0f6bf065f8f",
+    "md5": "3a838ffe896b8b29eabb645ffeddf5c4",
+    "python_files": [
+      "chimerax/amyloidmodifier/__init__.py",
+      "chimerax/amyloidmodifier/tool.py"
+    ],
+    "compiled_files": [],
+    "license_files": [
+      "ChimeraX_AmyloidModifier-1.11.dist-info/LICENSE"
+    ],
+    "requires_dist": [
+      "ChimeraX-Core ~=1.0"
+    ]
+  },
+  {
+    "download_url": "https://cxtoolshed.rbvi.ucsf.edu/download/chimeraxamyloidmodifier/1.12/1395",
+    "notes": "Added a feature on trimming/expanding models, allow fit-to-map as per chain or as per whole model\nAdded a feature to select a protofilament\nMinor change on UI",
+    "released": "2026-03-31T06:08:43",
+    "version": "1.12",
+    "filename": "ChimeraX_AmyloidModifier-1.12-py3-none-any.whl",
+    "bytes": 42191,
+    "sha256": "06f21c0134d2f26cd94d9414b86c1439a9ac8fe7eb152475f4a5685302614cac",
+    "md5": "4c9e63fa8ee550298a7cca469e668267",
+    "python_files": [
+      "chimerax/amyloidmodifier/__init__.py",
+      "chimerax/amyloidmodifier/tool.py"
+    ],
+    "compiled_files": [],
+    "license_files": [
+      "ChimeraX_AmyloidModifier-1.12.dist-info/LICENSE"
+    ],
+    "requires_dist": [
+      "ChimeraX-Core ~=1.0"
+    ]
+  },
+  {
+    "download_url": "https://cxtoolshed.rbvi.ucsf.edu/download/chimeraxamyloidmodifier/1.13/1401",
+    "notes": "Added a feature, Smart computing on helical axis (Optional):\n\nIf the tilt of the computed helical axis is within the maximum accuracy of the PDB/CIF file (depending on the decimal places), auto-snap to use the Z-Axis as the helical axis for expansion",
+    "released": "2026-04-15T08:19:05",
+    "version": "1.13",
+    "filename": "ChimeraX_AmyloidModifier-1.13-py3-none-any.whl",
+    "bytes": 43139,
+    "sha256": "a047da5b400826c14c4fd7ad2c4d705cdd81d2413cfee5b0cf6e22b5325f5816",
+    "md5": "0aeb9aca3f35a0c3d315829447698743",
+    "python_files": [
+      "chimerax/amyloidmodifier/__init__.py",
+      "chimerax/amyloidmodifier/tool.py"
+    ],
+    "compiled_files": [],
+    "license_files": [
+      "ChimeraX_AmyloidModifier-1.13.dist-info/LICENSE"
+    ],
+    "requires_dist": [
+      "ChimeraX-Core ~=1.0"
+    ]
+  },
+  {
+    "download_url": "https://cxtoolshed.rbvi.ucsf.edu/download/chimeraxamyloidmodifier/1.14/1422",
+    "notes": "Added support for common amino acid PTMs, resolving parsing issues for modified residues",
+    "released": "2026-05-22T02:55:50",
+    "version": "1.14",
+    "filename": "chimerax_amyloidmodifier-1.14-py3-none-any.whl",
+    "bytes": 42599,
+    "sha256": "957af56cd77e4377bef2690d9eb13686f508d1e3d4bf8b4292ea596971d3dbb3",
+    "md5": "d7dd2d73328d39b82959efa37af1d2f4",
+    "python_files": [
+      "chimerax/amyloidmodifier/__init__.py",
+      "chimerax/amyloidmodifier/tool.py"
+    ],
+    "compiled_files": [],
+    "license_files": [],
+    "requires_dist": [
+      "ChimeraX-Core~=1.0"
+    ]
+  },
+  {
+    "download_url": "https://cxtoolshed.rbvi.ucsf.edu/download/chimeraxamyloidmodifier/1.15/1465",
+    "notes": "Added \"Chain Connector\": Allow to merge all chains of an amyloid structure into one chain, which may aid in the use of RFdiffusion",
+    "released": "2026-07-22T00:23:06",
+    "version": "1.15",
+    "filename": "chimerax_amyloidmodifier-1.15-py3-none-any.whl",
+    "bytes": 44606,
+    "sha256": "2869ecba68e4bf31404d8e61795d5b3582a6e14f25aa310a8b2f8bc04d869ee8",
+    "md5": "b0d1e0481da62043ff4499a25a971e00",
+    "python_files": [
+      "chimerax/amyloidmodifier/__init__.py",
+      "chimerax/amyloidmodifier/tool.py"
+    ],
+    "compiled_files": [],
+    "license_files": [],
+    "requires_dist": [
+      "ChimeraX-Core~=1.0"
+    ]
+  },
+  {
+    "download_url": "https://cxtoolshed.rbvi.ucsf.edu/download/chimeraxamyloidmodifier/1.16/1488",
+    "notes": "Fix a bug on modifying cif files",
+    "released": "2026-09-14T20:45:43",
+    "version": "1.16",
+    "filename": "chimerax_amyloidmodifier-1.16-py3-none-any.whl",
+    "bytes": 43446,
+    "sha256": "228b34a27fdac22b50e38aa63a92c4b4bc93f50ba1aa6e4519aa3e2de9b7ad18",
+    "md5": "cc4d78535eab6d53bbf08863f85c2f81",
+    "python_files": [
+      "chimerax/amyloidmodifier/__init__.py",
+      "chimerax/amyloidmodifier/tool.py"
+    ],
+    "compiled_files": [],
+    "license_files": [],
+    "requires_dist": [
+      "ChimeraX-Core~=1.0"
+    ]
+  },
+  {
+    "download_url": "https://cxtoolshed.rbvi.ucsf.edu/download/chimeraxamyloidmodifier/2.0/1494",
+    "notes": "Improved automatic layer detection. Support anti-parallel structures, and structures with non-identical layers such as NMR structures. Detector estimates the stacking direction without requiring Z-axis alignment or a manual Anti setting. It is more tolerant of flexible termini like flexible heads, linkers and tails, as long as a stable core is present.\n\nCorrect handling of chains spanning multiple layers. Now the detection supports amyloids with multi-rung β-solenoid architectures (e.g., 2RNM, 9NQD). Chain units and physical layers are reported separately.\n\nMore flexible expansion. Added compatible repeat periods such as AAAA, ABAB, and ABCABC, etc., ncluding anti-parallel expansion.\n\nSafer structure editing. Tried to be more careful on standards of PDB/CIF files (yet still not recommend to use on publishing files). Replaced text-based coordinate manipulation with structured PDB/mmCIF processing and round-trip checks. Improved handling of alternate locations, insertion codes, anisotropic displacement tensors, ligands, waters, annotated bonds, and sheet references. Invalidated source metadata is tracked internally, and unsupported edits produce explicit errors.",
+    "released": "2026-09-24T10:46:03",
+    "version": "2.0",
+    "filename": "ChimeraX_AmyloidModifier-2.0-py3-none-any.whl",
+    "bytes": 65795,
+    "sha256": "39d3a90fee7a35a6edee879bc686c9f724a129eade83e516737ea6657c2e21cd",
+    "md5": "123a34ecd243098b144beae540e04904",
+    "python_files": [
+      "chimerax/amyloidmodifier/__init__.py",
+      "chimerax/amyloidmodifier/tool.py"
+    ],
+    "compiled_files": [],
+    "license_files": [
+      "ChimeraX_AmyloidModifier-2.0.dist-info/LICENSE"
+    ],
+    "requires_dist": [
+      "ChimeraX-Core ~=1.0"
+    ]
+  },
+  {
+    "download_url": "https://cxtoolshed.rbvi.ucsf.edu/download/chimeraxamyloidmodifier/2.0.1/1495",
+    "notes": "Emergency fix on dependency descriptions",
+    "released": "2026-09-24T11:08:40",
+    "version": "2.0.1",
+    "filename": "ChimeraX_AmyloidModifier-2.0.1-py3-none-any.whl",
+    "bytes": 65939,
+    "sha256": "e0034072ad3a06c082edbbf50afb57c625483786631b2793bbd9ed1f940987e8",
+    "md5": "63b086c9df73ba7dba9afe7ff7abbfa1",
+    "python_files": [
+      "chimerax/amyloidmodifier/__init__.py",
+      "chimerax/amyloidmodifier/tool.py"
+    ],
+    "compiled_files": [],
+    "license_files": [
+      "ChimeraX_AmyloidModifier-2.0.1.dist-info/LICENSE"
+    ],
+    "requires_dist": [
+      "ChimeraX-Core ~=1.0",
+      "gemmi <0.8,>=0.7.4",
+      "numpy"
+    ]
+  },
+  {
+    "download_url": "https://cxtoolshed.rbvi.ucsf.edu/download/chimeraxamyloidmodifier/2.1/1496",
+    "notes": "Now supports ligand expanding/trimming along with the amyloid layers",
+    "released": "2026-09-24T20:51:36",
+    "version": "2.1",
+    "filename": "chimerax_amyloidmodifier-2.1-py3-none-any.whl",
+    "bytes": 68810,
+    "sha256": "671878fe4d5e010e0555a212452a676387e774d62673d7a6d793f6ba2dde5252",
+    "md5": "05d1837d4e2d2a50853a727970c80ea1",
+    "python_files": [
+      "chimerax/amyloidmodifier/__init__.py",
+      "chimerax/amyloidmodifier/tool.py"
+    ],
+    "compiled_files": [],
+    "license_files": [],
+    "requires_dist": [
+      "ChimeraX-Core~=1.0",
+      "gemmi<0.8,>=0.7.4",
+      "numpy"
+    ]
+  },
+  {
+    "download_url": "https://cxtoolshed.rbvi.ucsf.edu/download/chimeraxamyloidmodifier/2.1.1/1497",
+    "notes": "Supports RNA ligand expanded/trimmed along with the amyloid layers",
+    "released": "2026-09-25T01:38:08",
+    "version": "2.1.1",
+    "filename": "chimerax_amyloidmodifier-2.1.1-py3-none-any.whl",
+    "bytes": 69862,
+    "sha256": "5ab8a529e07c2e628aa2c930d9f79d4e66253a99e2a365ed0e3c111436eafd30",
+    "md5": "7c50260d6131dbe71476a317825fbcdb",
+    "python_files": [
+      "chimerax/amyloidmodifier/__init__.py",
+      "chimerax/amyloidmodifier/tool.py"
+    ],
+    "compiled_files": [],
+    "license_files": [],
+    "requires_dist": [
+      "ChimeraX-Core~=1.0",
+      "gemmi<0.8,>=0.7.4",
+      "numpy"
+    ]
+  },
+  {
+    "download_url": "https://cxtoolshed.rbvi.ucsf.edu/download/chimeraxamyloidmodifier/2.1.2/1510",
+    "notes": "Improved layer-detection logic to better tolerate structural variation between stacked chains. Added support for expanding protofilaments with unequal layer counts by completing missing terminal layers first. Added a Run DSSP option to the expansion dialog, enabled by default.",
+    "released": "2026-10-13T00:38:06",
+    "version": "2.1.2",
+    "filename": "chimerax_amyloidmodifier-2.1.2-py3-none-any.whl",
+    "bytes": 82862,
+    "sha256": "d3d524ab5b05f2e0f97010f7230f3a55716936eec0e92e5998425f4c2b294bcd",
+    "md5": "bade1fc6ed998d0f60ed2206fe7dca83",
+    "python_files": [
+      "chimerax/amyloidmodifier/__init__.py",
+      "chimerax/amyloidmodifier/tool.py"
+    ],
+    "compiled_files": [],
+    "license_files": [],
+    "requires_dist": [
+      "ChimeraX-Core~=1.0",
+      "gemmi<0.8,>=0.7.4",
+      "numpy"
+    ]
+  },
+  {
+    "download_url": "https://cxtoolshed.rbvi.ucsf.edu/download/chimeraxamyloidmodifier/2.1.3/1515",
+    "notes": "Improved repeat recognition: Equivalent chains with different author residue numbering can now be matched correctly, without changing deposited residue numbers.\n\nImproved helical calculations: More stable axis estimation near zero twist and corrected screw-axis fitting for sufficiently rigid periodic repeats.\n\nSafer editing: Failed model replacements during loading, renaming, trimming, or expansion preserve the previous working model and edit buffer.\n\nCorrected restraint export: Generated commands use the current chain IDs and explicitly identify the working model. Session restoration: Editing history and preserved source annotations survive saving and restoring ChimeraX sessions.\n\nClearer diagnostics: Additional repeat-fit and near-overlap checks, with explicit reporting when expansion succeeds but DSSP annotation fails.\n\nGeneral code maintenance and consolidation of shared PDB/mmCIF workflows. LocalRes behavior is unchanged.",
+    "released": "2026-10-13T20:19:22",
+    "version": "2.1.3",
+    "filename": "chimerax_amyloidmodifier-2.1.3-py3-none-any.whl",
+    "bytes": 85946,
+    "sha256": "8b28786948495a269e7a4ac9512f4376f7d104883382f69cd7b11716b624971b",
+    "md5": "e755f6858a8d41c0e79460e05802a3f8",
+    "python_files": [
+      "chimerax/amyloidmodifier/__init__.py",
+      "chimerax/amyloidmodifier/tool.py"
+    ],
+    "compiled_files": [],
+    "license_files": [],
+    "requires_dist": [
+      "ChimeraX-Core~=1.0",
+      "gemmi<0.8,>=0.7.4",
+      "numpy"
+    ]
+  },
+  {
+    "download_url": "https://cxtoolshed.rbvi.ucsf.edu/download/chimeraxamyloidmodifier/2.2.0/1516",
+    "notes": "Local Resolution Tab function updates:\n\nAdded color presets and color customizations Added scalebar size Added key decimal place option",
+    "released": "2026-10-14T08:17:36",
+    "version": "2.2.0",
+    "filename": "ChimeraX_AmyloidModifier-2.2.0-py3-none-any.whl",
+    "bytes": 94606,
+    "sha256": "4083490550510024731a4a8a3654d1573bac501f81ebeb0d0c5348b544b0a845",
+    "md5": "f7e51868d19ae947d15f4f0ffcb98acd",
+    "python_files": [
+      "chimerax/amyloidmodifier/__init__.py",
+      "chimerax/amyloidmodifier/tool.py"
+    ],
+    "compiled_files": [],
+    "license_files": [
+      "ChimeraX_AmyloidModifier-2.2.0.dist-info/LICENSE"
+    ],
+    "requires_dist": [
+      "ChimeraX-Core ~=1.0",
+      "gemmi <0.8,>=0.7.4",
+      "numpy"
+    ]
+  },
+  {
+    "download_url": "https://cxtoolshed.rbvi.ucsf.edu/download/chimeraxamyloidmodifier/2.2.1/1522",
+    "notes": "Added scalebar color customization\n\nAdded color key customization",
+    "released": "2026-10-16T10:58:08",
+    "version": "2.2.1",
+    "filename": "ChimeraX_AmyloidModifier-2.2.1-py3-none-any.whl",
+    "bytes": 96426,
+    "sha256": "56d042a8ebb7458f435501ee824a314f178e972e74eff2ff064075e74588c34c",
+    "md5": "c0e2897dcb995c26b49dbc2947bd61df",
+    "python_files": [
+      "chimerax/amyloidmodifier/__init__.py",
+      "chimerax/amyloidmodifier/tool.py"
+    ],
+    "compiled_files": [],
+    "license_files": [
+      "ChimeraX_AmyloidModifier-2.2.1.dist-info/LICENSE"
+    ],
+    "requires_dist": [
+      "ChimeraX-Core ~=1.0",
+      "gemmi <0.8,>=0.7.4",
+      "numpy"
+    ]
+  },
+  {
+    "download_url": "https://cxtoolshed.rbvi.ucsf.edu/download/chimeraxamyloidmodifier/2.2.2/1537",
+    "notes": "Fixed a bug: When trimming a model that contains unequal number of layers for each protofilament, it gives errors",
+    "released": "2026-10-27T23:25:28",
+    "version": "2.2.2",
+    "filename": "chimerax_amyloidmodifier-2.2.2-py3-none-any.whl",
+    "bytes": 96139,
+    "sha256": "0042c23e24d6f44ba01d3c039b0e6e7a517edbc08af1bd38c4605087d498f8ad",
+    "md5": "026280ee98e7e834951f11964b76865e",
+    "python_files": [
+      "chimerax/amyloidmodifier/__init__.py",
+      "chimerax/amyloidmodifier/tool.py"
+    ],
+    "compiled_files": [],
+    "license_files": [],
+    "requires_dist": [
+      "ChimeraX-Core~=1.0",
+      "gemmi<0.8,>=0.7.4",
+      "numpy"
+    ]
+  }
+]

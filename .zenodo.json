@@ -1,0 +1,28 @@
+{
+  "title": "Amyloid Modifier for ChimeraX",
+  "upload_type": "software",
+  "version": "2.2.2",
+  "publication_date": "2026-10-27",
+  "license": "MIT",
+  "creators": [
+    {
+      "name": "Ou, Songxian",
+      "affiliation": "The University of Hong Kong"
+    }
+  ],
+  "description": "<p>Amyloid Modifier is a ChimeraX add-on that streamlines routine preparation and editing of multilayer amyloid fibril models. It provides a graphical interface for identifying layers and protofilaments, trimming and expanding fibril models, renaming chains, invoking secondary-structure reassignment, and generating ISOLDE torsion-restraint command files.</p><p>If you used Amyloid Modifier and would like to cite it, please use the reference below for the version you used. Citations are appreciated, but not expected.</p><p>Please also follow the citation guidance for ChimeraX and any underlying tools you use.</p><p>This repository snapshot contains 26 versioned wheels, including the latest version 2.2.2. Each wheel contains Python source and installation metadata. Historical ToolShed wheels are preserved byte for byte. Copyright (c) 2026 Songxian.</p>",
+  "keywords": [
+    "ChimeraX",
+    "amyloid",
+    "structural biology",
+    "cryo-EM",
+    "molecular modeling"
+  ],
+  "related_identifiers": [
+    {
+      "identifier": "https://cxtoolshed.rbvi.ucsf.edu/apps/chimeraxamyloidmodifier",
+      "relation": "isSupplementTo",
+      "scheme": "url"
+    }
+  ]
+}
