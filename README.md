@@ -1,5 +1,7 @@
 # Amyloid Modifier for ChimeraX
 
+[![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.23878286.svg)](https://doi.org/10.5281/zenodo.23878286)
+
 Amyloid Modifier provides a convenient graphical workflow for preparing multilayer amyloid fibril models in ChimeraX: identifying layers and protofilaments, trimming or expanding fibrils, renaming chains, reassessing secondary structure, and generating ISOLDE torsion-restraint commands.
 
 **Author:** Songxian Ou, Ruben Hervas Millan's Lab, The University of Hong Kong.
@@ -16,7 +18,7 @@ The wheels include the Python source and package metadata used by ChimeraX to id
 
 If you used Amyloid Modifier and would like to cite it, please use the reference for the version you used. **Citations are appreciated, but not expected.**
 
-Use GitHub's **Cite this repository** button or the citation on the corresponding Zenodo record. Please also follow the citation guidance for ChimeraX and any underlying tools you use.
+Use GitHub's **Cite this repository** button or the citation on the corresponding [Zenodo record](https://doi.org/10.5281/zenodo.23878286). Select the version you used on Zenodo; version 2.2.2 is available at [10.5281/zenodo.23878287](https://doi.org/10.5281/zenodo.23878287). Please also follow the citation guidance for ChimeraX and any underlying tools you use.
 
 ## Upload a new version (for the maintainer)
 
