@@ -25,6 +25,10 @@ ABSTRACT = ("Amyloid Modifier is a ChimeraX add-on that streamlines routine prep
             "fibril models, renaming chains, invoking secondary-structure reassignment, "
             "and generating ISOLDE torsion-restraint command files.")
 KEYWORDS = ["ChimeraX", "amyloid", "structural biology", "cryo-EM", "molecular modeling"]
+RESPONSIBILITY = ("Amyloid Modifier is solely the work of Songxian Ou. "
+                  "It does not represent or imply endorsement by Ruben Hervas Millan's lab. "
+                  "The lab is not responsible for the software, its use, or any resulting outcomes. "
+                  "The software is provided under the terms of the MIT License.")
 
 
 def version_key(version):
@@ -112,8 +116,9 @@ def prepare(root=ROOT):
     write_json(root / ".zenodo.json", {
         "title": TITLE, "upload_type": "software", "version": latest["version"],
         "publication_date": latest["released"][:10], "license": "MIT",
-        "creators": [{"name": "Ou, Songxian", "affiliation": "The University of Hong Kong"}],
+        "creators": [{"name": "Ou, Songxian"}],
         "description": f"<p>{html.escape(ABSTRACT)}</p><p>{html.escape(MESSAGE)}</p>"
+                       f"<p>{html.escape(RESPONSIBILITY)}</p>"
                        "<p>Please also follow the citation guidance for ChimeraX and any underlying tools you use.</p>"
                        f"<p>This repository snapshot contains {len(records)} versioned wheels, including the latest version "
                        f"{latest['version']}. Each wheel contains Python source and installation metadata. "
