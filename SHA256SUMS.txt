@@ -24,3 +24,4 @@ d3d524ab5b05f2e0f97010f7230f3a55716936eec0e92e5998425f4c2b294bcd  wheels/chimera
 4083490550510024731a4a8a3654d1573bac501f81ebeb0d0c5348b544b0a845  wheels/ChimeraX_AmyloidModifier-2.2.0-py3-none-any.whl
 56d042a8ebb7458f435501ee824a314f178e972e74eff2ff064075e74588c34c  wheels/ChimeraX_AmyloidModifier-2.2.1-py3-none-any.whl
 0042c23e24d6f44ba01d3c039b0e6e7a517edbc08af1bd38c4605087d498f8ad  wheels/chimerax_amyloidmodifier-2.2.2-py3-none-any.whl
+1fcd2f2d416d32c1e893ca7eb1a4df028ee1a3ee143b77e0596c3bb7b650117d  wheels/chimerax_amyloidmodifier-2.3.0-py3-none-any.whl

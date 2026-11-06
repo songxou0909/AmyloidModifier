@@ -5,9 +5,8 @@ title: "Amyloid Modifier for ChimeraX"
 authors:
   - family-names: Ou
     given-names: Songxian
-version: "2.2.2"
-date-released: 2026-10-27
-doi: "10.5281/zenodo.23878287"
+version: "2.3.0"
+date-released: 2026-11-06
 url: "https://cxtoolshed.rbvi.ucsf.edu/apps/chimeraxamyloidmodifier"
 repository-code: "https://github.com/songxou0909/AmyloidModifier"
 license: MIT
