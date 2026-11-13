@@ -1,15 +1,15 @@
 {
   "title": "Amyloid Modifier for ChimeraX",
   "upload_type": "software",
-  "version": "2.4.0",
-  "publication_date": "2026-11-10",
+  "version": "2.4.1",
+  "publication_date": "2026-11-13",
   "license": "MIT",
   "creators": [
     {
       "name": "Ou, Songxian"
     }
   ],
-  "description": "<p>Amyloid Modifier is a ChimeraX add-on that streamlines routine preparation and editing of multilayer amyloid fibril models. It provides a graphical interface for identifying layers and protofilaments, trimming and expanding fibril models, renaming chains, invoking secondary-structure reassignment, and generating ISOLDE torsion-restraint command files.</p><p>If you used Amyloid Modifier and would like to cite it, please use the reference below for the version you used. Citations are appreciated, but not expected.</p><p>Amyloid Modifier is solely the work of Songxian Ou. It does not represent or imply endorsement by Ruben Hervas Millan&#x27;s lab. The lab is not responsible for the software, its use, or any resulting outcomes. The software is provided under the terms of the MIT License.</p><p>Please also follow the citation guidance for ChimeraX and any underlying tools you use.</p><p>This repository snapshot contains 28 versioned wheels, including the latest version 2.4.0. Each wheel contains Python source and installation metadata. Historical ToolShed wheels are preserved byte for byte. Copyright (c) 2026 Songxian.</p>",
+  "description": "<p>Amyloid Modifier is a ChimeraX add-on that streamlines routine preparation and editing of multilayer amyloid fibril models. It provides a graphical interface for identifying layers and protofilaments, trimming and expanding fibril models, renaming chains, invoking secondary-structure reassignment, and generating ISOLDE torsion-restraint command files.</p><p>If you used Amyloid Modifier and would like to cite it, please use the reference below for the version you used. Citations are appreciated, but not expected.</p><p>Amyloid Modifier is solely the work of Songxian Ou. It does not represent or imply endorsement by Ruben Hervas Millan&#x27;s lab. The lab is not responsible for the software, its use, or any resulting outcomes. The software is provided under the terms of the MIT License.</p><p>Please also follow the citation guidance for ChimeraX and any underlying tools you use.</p><p>This repository snapshot contains 29 versioned wheels, including the latest version 2.4.1. Each wheel contains Python source and installation metadata. Historical ToolShed wheels are preserved byte for byte. Copyright (c) 2026 Songxian.</p>",
   "keywords": [
     "ChimeraX",
     "amyloid",

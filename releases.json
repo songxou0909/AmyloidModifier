@@ -574,5 +574,26 @@
     "released": "2026-11-10",
     "notes": "",
     "download_url": "https://github.com/songxou0909/AmyloidModifier/releases/download/v2.4.0/chimerax_amyloidmodifier-2.4.0-py3-none-any.whl"
+  },
+  {
+    "version": "2.4.1",
+    "filename": "chimerax_amyloidmodifier-2.4.1-py3-none-any.whl",
+    "bytes": 1222818,
+    "sha256": "d28ca078a16680b6fb6906a59a9bffde836bb85d7c1e4590feaaa3a281e8ceab",
+    "md5": "0091d948dac6e4a240eccb932ba4da88",
+    "python_files": [
+      "chimerax/amyloidmodifier/__init__.py",
+      "chimerax/amyloidmodifier/tool.py"
+    ],
+    "compiled_files": [],
+    "license_files": [],
+    "requires_dist": [
+      "ChimeraX-Core~=1.0",
+      "gemmi<0.8,>=0.7.4",
+      "numpy"
+    ],
+    "released": "2026-11-13",
+    "notes": "",
+    "download_url": "https://github.com/songxou0909/AmyloidModifier/releases/download/v2.4.1/chimerax_amyloidmodifier-2.4.1-py3-none-any.whl"
   }
 ]
