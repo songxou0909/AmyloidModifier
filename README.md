@@ -72,10 +72,11 @@ The initial collection contains all 26 versions available from ToolShed on 2026-
 The initial GitHub release is a snapshot containing the whole collection; the older wheels do not each have a separate GitHub Release or Zenodo DOI. Future releases archive the growing collection and identify the latest version.
 
 <!-- WHEELS:START -->
-Latest: **2.4.6**. 34 archived wheels.
+Latest: **2.4.7**. 35 archived wheels.
 
 | Version | Released | Download |
 | --- | --- | --- |
+| 2.4.7 | 2026-11-27 | [Wheel](wheels/chimerax_amyloidmodifier-2.4.7-py3-none-any.whl) |
 | 2.4.6 | 2026-11-27 | [Wheel](wheels/chimerax_amyloidmodifier-2.4.6-py3-none-any.whl) |
 | 2.4.5 | 2026-11-27 | [Wheel](wheels/chimerax_amyloidmodifier-2.4.5-py3-none-any.whl) |
 | 2.4.4 | 2026-11-23 | [Wheel](wheels/chimerax_amyloidmodifier-2.4.4-py3-none-any.whl) |
